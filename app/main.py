@@ -5,6 +5,7 @@ import requests
 import json
 from io import BytesIO
 import warnings
+import re
 
 import yfinance as yf
 warnings.filterwarnings("ignore")
@@ -23,13 +24,28 @@ app.add_middleware(
 )
 
 # ============================
-# 外部ファイル URL
+# 外部ファイル URL（Raw）
 # ============================
 BASE_URL = "https://raw.githubusercontent.com/yt-F6D34A22-537C-E881-530F-F9E7A956A78B/batches/main/data/"
 
 DATA_JSON_URL = BASE_URL + "data.json"
 EXCEL_URL = BASE_URL + "data_j.xlsx"
-HEURISTICS_JSON_URL = BASE_URL + "heuristics.json"
+
+# ============================
+# GitHub API URL（BASE_URL から抽出）
+# ============================
+# BASE_URL 例:
+# https://raw.githubusercontent.com/<USER>/<REPO>/<BRANCH>/data/
+m = re.match(r"https://raw.githubusercontent.com/([^/]+)/([^/]+)/([^/]+)/data/", BASE_URL)
+if not m:
+    raise ValueError("Invalid BASE_URL format")
+
+repo_user = m.group(1)
+repo_name = m.group(2)
+branch = m.group(3)
+
+# heuristics フォルダの GitHub API URL
+API_ROOT_HEURISTICS = f"https://api.github.com/repos/{repo_user}/{repo_name}/contents/data/heuristics"
 
 # ============================
 # データ読み込み
@@ -215,16 +231,68 @@ def screening(
         return results[:100]
 
     # ----------------------------
-    # モード C：heuristics.json を返す
+    # モード C：heuristics（target_date 指定対応）
     # ----------------------------
     elif mode == "heuristics":
         try:
-            url = f"{HEURISTICS_JSON_URL}?t={pd.Timestamp.now().timestamp()}"
-            resp = requests.get(url)
+            # ----------------------------
+            # target_date=YYYYMMDD が指定された場合
+            # ----------------------------
+            if target_date:
+                if not re.match(r"^\d{8}$", target_date):
+                    return {"error": "invalid target_date format (expected YYYYMMDD)"}
+
+                yyyymm = target_date[:6]
+                file_name = f"heuristics_{target_date}.json"
+
+                # API でファイル一覧を取得
+                resp = requests.get(f"{API_ROOT_HEURISTICS}/{yyyymm}")
+                if resp.status_code != 200:
+                    return {"error": f"folder {yyyymm} not found"}
+
+                files = resp.json()
+                match = next((f for f in files if f["name"] == file_name), None)
+                if not match:
+                    return {"error": f"heuristics file not found for {target_date}"}
+
+                # download_url を使って JSON を取得
+                raw_url = match["download_url"]
+                resp2 = requests.get(raw_url)
+                resp2.raise_for_status()
+                return json.loads(resp2.text)
+
+            # ----------------------------
+            # target_date が無い場合 → 最新 heuristics を返す
+            # ----------------------------
+            resp = requests.get(API_ROOT_HEURISTICS)
             resp.raise_for_status()
-            return json.loads(resp.text)
+            folders = resp.json()
+
+            ym_folders = [f["name"] for f in folders if re.match(r"^\d{6}$", f["name"])]
+            if not ym_folders:
+                return {"error": "no heuristics folders found"}
+
+            latest_ym = sorted(ym_folders)[-1]
+
+            resp2 = requests.get(f"{API_ROOT_HEURISTICS}/{latest_ym}")
+            resp2.raise_for_status()
+            files = resp2.json()
+
+            pattern = re.compile(r"^heuristics_(\d{8})\.json$")
+            dated_files = [f for f in files if pattern.match(f["name"])]
+
+            if not dated_files:
+                return {"error": "no heuristics json found in latest folder"}
+
+            latest_file = sorted(dated_files, key=lambda x: x["name"])[-1]
+
+            raw_url = latest_file["download_url"]
+            resp3 = requests.get(raw_url)
+            resp3.raise_for_status()
+            return json.loads(resp3.text)
+
         except Exception as e:
-            return {"error": f"failed to load heuristics.json: {str(e)}"}
+            return {"error": f"failed to load heuristics: {str(e)}"}
 
     else:
         return {"error": "invalid mode"}
@@ -268,7 +336,7 @@ def chart(ticker: str, timeframe: str = "1d"):
         "Low": "min",
         "Close": "last",
         "Volume": "sum"
-    }).dropna(subset=["Open", "Close"])
+    }).dropna(subset(["Open", "Close"]))
 
     # ---- timeframe に応じて返す ----
     if timeframe == "1d":
