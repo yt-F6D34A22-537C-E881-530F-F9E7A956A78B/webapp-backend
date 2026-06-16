@@ -270,12 +270,12 @@ def screening(
         return results[:100]
 
     # ----------------------------
-    # モード C：heuristics（target_date 指定対応）
+    # モード C：heuristics（配列形式 + target_date）
     # ----------------------------
     elif mode == "heuristics":
         try:
             # ----------------------------
-            # target_date=YYYYMMDD が指定された場合
+            # 1. target_date が指定された場合
             # ----------------------------
             if target_date:
                 if not re.match(r"^\d{8}$", target_date):
@@ -298,10 +298,25 @@ def screening(
                 raw_url = match["download_url"]
                 resp2 = requests.get(raw_url)
                 resp2.raise_for_status()
-                return json.loads(resp2.text)
+                raw_dict = json.loads(resp2.text)
+
+                # 配列形式に変換
+                array_data = []
+                for code, tech in raw_dict.items():
+                    name = next((r["銘柄名"] for r in ticker_list if str(r["コード"]) == code), "")
+                    array_data.append({
+                        "コード": code,
+                        "銘柄名": name,
+                        **tech
+                    })
+
+                return {
+                    "target_date": target_date,
+                    "data": array_data
+                }
 
             # ----------------------------
-            # target_date が無い場合 → 最新 heuristics を返す
+            # 2. target_date が無い場合 → 最新日付を返す
             # ----------------------------
             resp = requests.get(API_ROOT_HEURISTICS)
             resp.raise_for_status()
@@ -324,11 +339,26 @@ def screening(
                 return {"error": "no heuristics json found in latest folder"}
 
             latest_file = sorted(dated_files, key=lambda x: x["name"])[-1]
+            latest_date = latest_file["name"].replace("heuristics_", "").replace(".json", "")
 
             raw_url = latest_file["download_url"]
             resp3 = requests.get(raw_url)
             resp3.raise_for_status()
-            return json.loads(resp3.text)
+            raw_dict = json.loads(resp3.text)
+
+            array_data = []
+            for code, tech in raw_dict.items():
+                name = next((r["銘柄名"] for r in ticker_list if str(r["コード"]) == code), "")
+                array_data.append({
+                    "コード": code,
+                    "銘柄名": name,
+                    **tech
+                })
+
+            return {
+                "target_date": latest_date,
+                "data": array_data
+            }
 
         except Exception as e:
             return {"error": f"failed to load heuristics: {str(e)}"}
