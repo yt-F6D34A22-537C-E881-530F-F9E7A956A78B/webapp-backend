@@ -56,16 +56,24 @@ data_json = {}
 
 def load_ticker_list():
     global ticker_list
-    resp = requests.get(EXCEL_URL)
-    resp.raise_for_status()
-    df = pd.read_excel(BytesIO(resp.content))
-    ticker_list = df.to_dict(orient="records")
+    try:
+        resp = requests.get(EXCEL_URL)
+        resp.raise_for_status()
+        df = pd.read_excel(BytesIO(resp.content))
+        ticker_list = df.to_dict(orient="records")
+    except Exception as e:
+        print("Failed to load ticker list:", e)
+        ticker_list = []
 
 def load_data_json():
     global data_json
-    resp = requests.get(DATA_JSON_URL)
-    resp.raise_for_status()
-    data_json = json.loads(resp.text)
+    try:
+        resp = requests.get(DATA_JSON_URL)
+        resp.raise_for_status()
+        data_json = json.loads(resp.text)
+    except Exception as e:
+        print("Failed to load data.json:", e)
+        data_json = {}
 
 load_ticker_list()
 load_data_json()
@@ -75,13 +83,16 @@ load_data_json()
 # ============================
 @app.get("/dates")
 def get_dates():
-    all_dates = set()
-    for symbol, entry in data_json.items():
-        if isinstance(entry, dict):
-            for d in entry.keys():
-                if d.isdigit():
-                    all_dates.add(d)
-    return sorted(all_dates, reverse=True)
+    try:
+        all_dates = set()
+        for symbol, entry in data_json.items():
+            if isinstance(entry, dict):
+                for d in entry.keys():
+                    if d.isdigit():
+                        all_dates.add(d)
+        return {"status": "ok", "dates": sorted(all_dates, reverse=True)}
+    except Exception as e:
+        return {"error": "failed to load dates", "detail": str(e)}
 
 # ============================
 # /heuristics_dates
@@ -89,8 +100,9 @@ def get_dates():
 @app.get("/heuristics_dates")
 def get_heuristics_dates():
     """
-    GitHub trees API を 1 回だけ叩いて、
-    data/heuristics/**/heuristics_YYYYMMDD.json をすべて抽出する。
+    GitHub trees API を1回だけ叩き、
+    data/heuristics/**/heuristics_YYYYMMDD.json を抽出。
+    エラー時は詳細を返却する。
     """
     try:
         resp = requests.get(GIT_TREE_API)
@@ -107,10 +119,16 @@ def get_heuristics_dates():
             if m:
                 dates.append(m.group(1))
 
-        return sorted(dates, reverse=True)
+        return {
+            "status": "ok",
+            "dates": sorted(dates, reverse=True)
+        }
 
-    except Exception:
-        return []
+    except Exception as e:
+        return {
+            "error": "exception",
+            "detail": str(e)
+        }
 
 # ============================
 # /screening（ratio + date_ranking + heuristics）
@@ -128,78 +146,82 @@ def screening(
     # モード A：出来高 × 上髭
     # ----------------------------
     if mode == "ratio":
-        for row in ticker_list:
-            code = str(row["コード"])
-            name = row["銘柄名"]
-            symbol = f"{code}.T"
+        try:
+            for row in ticker_list:
+                code = str(row["コード"])
+                name = row["銘柄名"]
+                symbol = f"{code}.T"
 
-            if symbol not in data_json:
-                continue
-
-            entry = data_json[symbol]
-            if not isinstance(entry, dict):
-                continue
-
-            dates = sorted([d for d in entry.keys() if d.isdigit()])
-
-            if target_date and target_date in dates:
-                idx = dates.index(target_date)
-                if idx == 0:
-                    continue
-                today_key = dates[idx]
-                prev_key = dates[idx - 1]
-            else:
-                if len(dates) < 2:
-                    continue
-                today_key = dates[-1]
-                prev_key = dates[-2]
-
-            today = entry.get(today_key)
-            prev = entry.get(prev_key)
-
-            if not today or not prev:
-                continue
-
-            try:
-                prev_vol = prev.get("v")
-                today_vol = today.get("v")
-
-                if not prev_vol or prev_vol <= 0:
+                if symbol not in data_json:
                     continue
 
-                vol_ratio_val = today_vol / prev_vol
-
-                high = today.get("h")
-                open_ = today.get("o")
-                close = today.get("c")
-
-                if high is None or open_ is None or close is None:
+                entry = data_json[symbol]
+                if not isinstance(entry, dict):
                     continue
 
-                upper_shadow = high - max(open_, close)
-                real_body = abs(close - open_)
+                dates = sorted([d for d in entry.keys() if d.isdigit()])
 
-                if real_body <= 0:
+                if target_date and target_date in dates:
+                    idx = dates.index(target_date)
+                    if idx == 0:
+                        continue
+                    today_key = dates[idx]
+                    prev_key = dates[idx - 1]
+                else:
+                    if len(dates) < 2:
+                        continue
+                    today_key = dates[-1]
+                    prev_key = dates[-2]
+
+                today = entry.get(today_key)
+                prev = entry.get(prev_key)
+
+                if not today or not prev:
                     continue
 
-                shadow_ratio_val = upper_shadow / real_body
+                try:
+                    prev_vol = prev.get("v")
+                    today_vol = today.get("v")
 
-                if vol_ratio_val >= volume_ratio and shadow_ratio_val >= shadow_ratio:
-                    results.append({
-                        "コード": code,
-                        "銘柄名": name,
-                        "出来高倍率": round(vol_ratio_val, 2),
-                        "上髭実体比": round(shadow_ratio_val, 2),
-                        "出来高": int(today_vol),
-                        "上髭": round(upper_shadow, 2),
-                        "実体": round(real_body, 2),
-                    })
+                    if not prev_vol or prev_vol <= 0:
+                        continue
 
-            except Exception:
-                continue
+                    vol_ratio_val = today_vol / prev_vol
 
-        results.sort(key=lambda x: x["コード"])
-        return results
+                    high = today.get("h")
+                    open_ = today.get("o")
+                    close = today.get("c")
+
+                    if high is None or open_ is None or close is None:
+                        continue
+
+                    upper_shadow = high - max(open_, close)
+                    real_body = abs(close - open_)
+
+                    if real_body <= 0:
+                        continue
+
+                    shadow_ratio_val = upper_shadow / real_body
+
+                    if vol_ratio_val >= volume_ratio and shadow_ratio_val >= shadow_ratio:
+                        results.append({
+                            "コード": code,
+                            "銘柄名": name,
+                            "出来高倍率": round(vol_ratio_val, 2),
+                            "上髭実体比": round(shadow_ratio_val, 2),
+                            "出来高": int(today_vol),
+                            "上髭": round(upper_shadow, 2),
+                            "実体": round(real_body, 2),
+                        })
+
+                except Exception:
+                    continue
+
+            results.sort(key=lambda x: x["コード"])
+            return {"status": "ok", "data": results}
+
+        except Exception as e:
+            return {"error": "ratio screening failed", "detail": str(e)}
 
     # ----------------------------
     # モード B：値上がり率ランキング
@@ -208,57 +230,61 @@ def screening(
         if not target_date:
             return {"error": "target_date is required"}
 
-        for row in ticker_list:
-            code = str(row["コード"])
-            name = row["銘柄名"]
-            symbol = f"{code}.T"
+        try:
+            for row in ticker_list:
+                code = str(row["コード"])
+                name = row["銘柄名"]
+                symbol = f"{code}.T"
 
-            if symbol not in data_json:
-                continue
-
-            entry = data_json[symbol]
-            if not isinstance(entry, dict):
-                continue
-
-            dates = sorted([d for d in entry.keys() if d.isdigit()])
-            if target_date not in dates:
-                continue
-
-            idx = dates.index(target_date)
-            if idx == 0:
-                continue
-
-            prev_key = dates[idx - 1]
-
-            today = entry[target_date]
-            prev = entry[prev_key]
-
-            if not today or not prev:
-                continue
-
-            try:
-                today_close = today.get("c")
-                prev_close = prev.get("c")
-
-                if not prev_close or prev_close <= 0:
+                if symbol not in data_json:
                     continue
 
-                change_rate = (today_close - prev_close) / prev_close * 100
+                entry = data_json[symbol]
+                if not isinstance(entry, dict):
+                    continue
 
-                results.append({
-                    "コード": code,
-                    "銘柄名": name,
-                    "値上がり率": round(change_rate, 2),
-                    "当日終値": today_close,
-                    "前日終値": prev_close,
-                    "日付": target_date
-                })
+                dates = sorted([d for d in entry.keys() if d.isdigit()])
+                if target_date not in dates:
+                    continue
 
-            except Exception:
-                continue
+                idx = dates.index(target_date)
+                if idx == 0:
+                    continue
 
-        results.sort(key=lambda x: x["値上がり率"], reverse=True)
-        return results[:100]
+                prev_key = dates[idx - 1]
+
+                today = entry[target_date]
+                prev = entry[prev_key]
+
+                if not today or not prev:
+                    continue
+
+                try:
+                    today_close = today.get("c")
+                    prev_close = prev.get("c")
+
+                    if not prev_close or prev_close <= 0:
+                        continue
+
+                    change_rate = (today_close - prev_close) / prev_close * 100
+
+                    results.append({
+                        "コード": code,
+                        "銘柄名": name,
+                        "値上がり率": round(change_rate, 2),
+                        "当日終値": today_close,
+                        "前日終値": prev_close,
+                        "日付": target_date
+                    })
+
+                except Exception:
+                    continue
+
+            results.sort(key=lambda x: x["値上がり率"], reverse=True)
+            return {"status": "ok", "data": results[:100]}
+
+        except Exception as e:
+            return {"error": "date_ranking failed", "detail": str(e)}
 
     # ----------------------------
     # モード C：heuristics
@@ -273,7 +299,11 @@ def screening(
 
             resp = requests.get(raw_url)
             if resp.status_code != 200:
-                return {"error": f"heuristics file not found for {target_date}"}
+                return {
+                    "error": "heuristics file not found",
+                    "status": resp.status_code,
+                    "url": raw_url
+                }
 
             raw_dict = json.loads(resp.text)
 
@@ -285,18 +315,15 @@ def screening(
                 name = next((r["銘柄名"] for r in ticker_list if str(r["コード"]) == code_str), "")
 
                 array_data.append({
-                    "コード": code_str,  # ← ".T" を付けない
+                    "コード": code_str,
                     "銘柄名": name,
                     **tech
                 })
 
-            return {
-                "target_date": target_date,
-                "data": array_data
-            }
+            return {"status": "ok", "target_date": target_date, "data": array_data}
 
         except Exception as e:
-            return {"error": f"failed to load heuristics: {str(e)}"}
+            return {"error": "heuristics failed", "detail": str(e)}
 
     else:
         return {"error": "invalid mode"}
@@ -306,62 +333,68 @@ def screening(
 # ============================
 @app.get("/chart")
 def chart(ticker: str, timeframe: str = "1d"):
-    symbol = f"{ticker}.T"
+    try:
+        symbol = f"{ticker}.T"
 
-    # 日足を長期間取得
-    df = yf.download(symbol, period="6000d", interval="1d", progress=False)
-    if df.empty:
-        return {"error": "no data"}
+        # 日足を長期間取得
+        df = yf.download(symbol, period="6000d", interval="1d", progress=False)
+        if df.empty:
+            return {"error": "no data"}
 
-    # MultiIndex 対応
-    if isinstance(df.columns, pd.MultiIndex):
-        try:
-            df = df.xs(symbol, level=1, axis=1)
-        except Exception:
-            pass
+        if isinstance(df.columns, pd.MultiIndex):
+            try:
+                df = df.xs(symbol, level=1, axis=1)
+            except Exception:
+                pass
 
-    # DatetimeIndex を保証
-    df.index = pd.to_datetime(df.index, errors="coerce")
-    df = df.dropna(subset=["Open", "High", "Low", "Close"])
+        df.index = pd.to_datetime(df.index, errors="coerce")
+        df = df.dropna(subset=["Open", "High", "Low", "Close"])
 
-    # ---- 週足（W-FRI）----
-    df_week = df.resample("W-FRI").agg({
-        "Open": "first",
-        "High": "max",
-        "Low": "min",
-        "Close": "last",
-        "Volume": "sum"
-    }).dropna(subset=["Open", "Close"])
+        # ---- 週足（W-FRI）----
+        df_week = df.resample("W-FRI").agg({
+            "Open": "first",
+            "High": "max",
+            "Low": "min",
+            "Close": "last",
+            "Volume": "sum"
+        }).dropna(subset=["Open", "Close"])
 
-    # ---- 月足（ME：Month-End）----
-    df_month = df.resample("ME").agg({
-        "Open": "first",
-        "High": "max",
-        "Low": "min",
-        "Close": "last",
-        "Volume": "sum"
-    }).dropna(subset=["Open", "Close"])
+        # ---- 月足（ME：Month-End）----
+        df_month = df.resample("ME").agg({
+            "Open": "first",
+            "High": "max",
+            "Low": "min",
+            "Close": "last",
+            "Volume": "sum"
+        }).dropna(subset=["Open", "Close"])
 
-    # ---- timeframe に応じて返す ----
-    if timeframe == "1d":
-        df_out = df.tail(200)
-    elif timeframe == "1wk":
-        df_out = df_week.tail(200)
-    elif timeframe == "1mo":
-        df_out = df_month.tail(200)
-    else:
-        return {"error": "invalid timeframe"}
+        # ---- timeframe に応じて返す ----
+        if timeframe == "1d":
+            df_out = df.tail(200)
+        elif timeframe == "1wk":
+            df_out = df_week.tail(200)
+        elif timeframe == "1mo":
+            df_out = df_month.tail(200)
+        else:
+            return {"error": "invalid timeframe"}
 
-    df_out.index = df_out.index.strftime("%Y-%m-%d")
+        df_out.index = df_out.index.strftime("%Y-%m-%d")
 
-    return {
-        "Open": df_out["Open"].to_dict(),
-        "High": df_out["High"].to_dict(),
-        "Low": df_out["Low"].to_dict(),
-        "Close": df_out["Close"].to_dict(),
-        "Volume": df_out["Volume"].to_dict(),
-    }
-    
+        return {
+            "status": "ok",
+            "Open": df_out["Open"].to_dict(),
+            "High": df_out["High"].to_dict(),
+            "Low": df_out["Low"].to_dict(),
+            "Close": df_out["Close"].to_dict(),
+            "Volume": df_out["Volume"].to_dict(),
+        }
+
+    except Exception as e:
+        return {"error": "chart failed", "detail": str(e)}
+
+# ============================
+# debug_tree（trees API の生レスポンス）
+# ============================
 @app.get("/debug_tree")
 def debug_tree():
     try:
