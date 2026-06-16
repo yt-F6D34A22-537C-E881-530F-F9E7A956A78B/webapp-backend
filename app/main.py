@@ -357,3 +357,15 @@ def chart(ticker: str, timeframe: str = "1d"):
         "Close": df_out["Close"].to_dict(),
         "Volume": df_out["Volume"].to_dict(),
     }
+
+@app.get("/debug_tree")
+def debug_tree():
+    try:
+        resp = requests.get(GIT_TREE_API)
+        return {
+            "status": resp.status_code,
+            "url": GIT_TREE_API,
+            "json": resp.json()
+        }
+    except Exception as e:
+        return {"error": str(e)}
