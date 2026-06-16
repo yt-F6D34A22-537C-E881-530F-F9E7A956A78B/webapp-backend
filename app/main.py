@@ -102,6 +102,7 @@ def get_heuristics_dates():
 
         for item in tree:
             path = item.get("path", "")
+            # data/heuristics/202606/heuristics_20260615.json
             m = re.match(r"data/heuristics/\d{6}/heuristics_(\d{8})\.json$", path)
             if m:
                 dates.append(m.group(1))
@@ -267,7 +268,6 @@ def screening(
             return {"error": "target_date is required"}
 
         try:
-            # heuristics_YYYYMMDD.json の Raw URL を直接生成
             yyyymm = target_date[:6]
             raw_url = f"{RAW_HEURISTICS_PREFIX}{yyyymm}/heuristics_{target_date}.json"
 
@@ -279,9 +279,13 @@ def screening(
 
             array_data = []
             for code, tech in raw_dict.items():
-                name = next((r["銘柄名"] for r in ticker_list if str(r["コード"]) == code), "")
+                code_str = str(code)
+
+                # ticker_list のコードと一致させる
+                name = next((r["銘柄名"] for r in ticker_list if str(r["コード"]) == code_str), "")
+
                 array_data.append({
-                    "コード": code,
+                    "コード": code_str,  # ← ".T" を付けない
                     "銘柄名": name,
                     **tech
                 })
