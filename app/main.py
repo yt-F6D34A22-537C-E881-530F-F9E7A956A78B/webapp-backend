@@ -6,6 +6,7 @@ import json
 from io import BytesIO
 import warnings
 import re
+import os
 
 import yfinance as yf
 warnings.filterwarnings("ignore")
@@ -22,6 +23,18 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ============================
+# GitHub Token（環境変数から取得）
+# ============================
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+
+def github_headers():
+    """GitHub API 用ヘッダ（Token があれば付与）"""
+    headers = {}
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"token {GITHUB_TOKEN}"
+    return headers
 
 # ============================
 # 外部ファイル URL（Raw）
@@ -103,11 +116,16 @@ def get_heuristics_dates():
     GitHub trees API を1回だけ叩き、
     data/heuristics/**/heuristics_YYYYMMDD.json を抽出。
     エラー時は詳細を返却する。
+    Token を付与して rate limit を回避。
     """
     try:
-        resp = requests.get(GIT_TREE_API)
+        resp = requests.get(GIT_TREE_API, headers=github_headers())
         if resp.status_code != 200:
-            return []
+            return {
+                "error": "GitHub API error",
+                "status": resp.status_code,
+                "detail": resp.text
+            }
 
         tree = resp.json().get("tree", [])
         dates = []
@@ -125,10 +143,7 @@ def get_heuristics_dates():
         }
 
     except Exception as e:
-        return {
-            "error": "exception",
-            "detail": str(e)
-        }
+        return {"error": "exception", "detail": str(e)}
 
 # ============================
 # /screening（ratio + date_ranking + heuristics）
@@ -297,7 +312,7 @@ def screening(
             yyyymm = target_date[:6]
             raw_url = f"{RAW_HEURISTICS_PREFIX}{yyyymm}/heuristics_{target_date}.json"
 
-            resp = requests.get(raw_url)
+            resp = requests.get(raw_url, headers=github_headers())
             if resp.status_code != 200:
                 return {
                     "error": "heuristics file not found",
@@ -398,7 +413,7 @@ def chart(ticker: str, timeframe: str = "1d"):
 @app.get("/debug_tree")
 def debug_tree():
     try:
-        resp = requests.get(GIT_TREE_API)
+        resp = requests.get(GIT_TREE_API, headers=github_headers())
         return {
             "status": resp.status_code,
             "url": GIT_TREE_API,
