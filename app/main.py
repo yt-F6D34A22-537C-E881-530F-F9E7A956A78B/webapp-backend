@@ -83,6 +83,45 @@ def get_dates():
     return sorted(all_dates, reverse=True)
 
 # ============================
+# /heuristics_dates
+# ============================
+@app.get("/heuristics_dates")
+def get_heuristics_dates():
+    """
+    GitHub API を利用して data/heuristics/YYYYMM/heuristics_YYYYMMDD.json を探索し、
+    存在する YYYYMMDD の一覧を降順で返す。
+    """
+    try:
+        api_root = API_ROOT_HEURISTICS
+
+        # 1. YYYYMM フォルダ一覧
+        resp = requests.get(api_root)
+        resp.raise_for_status()
+        folders = resp.json()
+
+        ym_folders = [f["name"] for f in folders if re.match(r"^\d{6}$", f["name"])]
+        ym_folders.sort()
+
+        all_dates = []
+
+        # 2. 各 YYYYMM フォルダ内の heuristics_YYYYMMDD.json を列挙
+        for ym in ym_folders:
+            resp2 = requests.get(f"{api_root}/{ym}")
+            resp2.raise_for_status()
+            files = resp2.json()
+
+            for f in files:
+                m = re.match(r"^heuristics_(\d{8})\.json$", f["name"])
+                if m:
+                    all_dates.append(m.group(1))
+
+        # 3. 降順で返す
+        return sorted(all_dates, reverse=True)
+
+    except Exception as e:
+        return {"error": f"failed to load heuristics dates: {str(e)}"}
+
+# ============================
 # /screening（ratio + date_ranking + heuristics）
 # ============================
 @app.get("/screening")
@@ -336,7 +375,7 @@ def chart(ticker: str, timeframe: str = "1d"):
         "Low": "min",
         "Close": "last",
         "Volume": "sum"
-    }).dropna(subset(["Open", "Close"]))
+    }).dropna(subset=["Open", "Close"])
 
     # ---- timeframe に応じて返す ----
     if timeframe == "1d":
