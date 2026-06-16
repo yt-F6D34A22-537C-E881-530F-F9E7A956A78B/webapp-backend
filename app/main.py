@@ -30,6 +30,7 @@ BASE_URL = "https://raw.githubusercontent.com/yt-F6D34A22-537C-E881-530F-F9E7A95
 
 DATA_JSON_URL = BASE_URL + "data.json"
 EXCEL_URL = BASE_URL + "data_j.xlsx"
+RAW_HEURISTICS_PREFIX = BASE_URL + "heuristics/"
 
 # ============================
 # GitHub API URL（BASE_URL から抽出）
@@ -44,8 +45,8 @@ repo_user = m.group(1)
 repo_name = m.group(2)
 branch = m.group(3)
 
-# heuristics フォルダの GitHub API URL
-API_ROOT_HEURISTICS = f"https://api.github.com/repos/{repo_user}/{repo_name}/contents/data/heuristics"
+# GitHub trees API（全ファイル一覧を1回で取得）
+GIT_TREE_API = f"https://api.github.com/repos/{repo_user}/{repo_name}/git/trees/{branch}?recursive=1"
 
 # ============================
 # データ読み込み
@@ -88,38 +89,27 @@ def get_dates():
 @app.get("/heuristics_dates")
 def get_heuristics_dates():
     """
-    GitHub API を利用して data/heuristics/YYYYMM/heuristics_YYYYMMDD.json を探索し、
-    存在する YYYYMMDD の一覧を降順で返す。
+    GitHub trees API を 1 回だけ叩いて、
+    data/heuristics/**/heuristics_YYYYMMDD.json をすべて抽出する。
     """
     try:
-        api_root = API_ROOT_HEURISTICS
+        resp = requests.get(GIT_TREE_API)
+        if resp.status_code != 200:
+            return []
 
-        # 1. YYYYMM フォルダ一覧
-        resp = requests.get(api_root)
-        resp.raise_for_status()
-        folders = resp.json()
+        tree = resp.json().get("tree", [])
+        dates = []
 
-        ym_folders = [f["name"] for f in folders if re.match(r"^\d{6}$", f["name"])]
-        ym_folders.sort()
+        for item in tree:
+            path = item.get("path", "")
+            m = re.match(r"data/heuristics/\d{6}/heuristics_(\d{8})\.json$", path)
+            if m:
+                dates.append(m.group(1))
 
-        all_dates = []
+        return sorted(dates, reverse=True)
 
-        # 2. 各 YYYYMM フォルダ内の heuristics_YYYYMMDD.json を列挙
-        for ym in ym_folders:
-            resp2 = requests.get(f"{api_root}/{ym}")
-            resp2.raise_for_status()
-            files = resp2.json()
-
-            for f in files:
-                m = re.match(r"^heuristics_(\d{8})\.json$", f["name"])
-                if m:
-                    all_dates.append(m.group(1))
-
-        # 3. 降順で返す
-        return sorted(all_dates, reverse=True)
-
-    except Exception as e:
-        return {"error": f"failed to load heuristics dates: {str(e)}"}
+    except Exception:
+        return []
 
 # ============================
 # /screening（ratio + date_ranking + heuristics）
@@ -270,81 +260,22 @@ def screening(
         return results[:100]
 
     # ----------------------------
-    # モード C：heuristics（配列形式 + target_date）
+    # モード C：heuristics
     # ----------------------------
     elif mode == "heuristics":
+        if not target_date:
+            return {"error": "target_date is required"}
+
         try:
-            # ----------------------------
-            # 1. target_date が指定された場合
-            # ----------------------------
-            if target_date:
-                if not re.match(r"^\d{8}$", target_date):
-                    return {"error": "invalid target_date format (expected YYYYMMDD)"}
+            # heuristics_YYYYMMDD.json の Raw URL を直接生成
+            yyyymm = target_date[:6]
+            raw_url = f"{RAW_HEURISTICS_PREFIX}{yyyymm}/heuristics_{target_date}.json"
 
-                yyyymm = target_date[:6]
-                file_name = f"heuristics_{target_date}.json"
+            resp = requests.get(raw_url)
+            if resp.status_code != 200:
+                return {"error": f"heuristics file not found for {target_date}"}
 
-                # API でファイル一覧を取得
-                resp = requests.get(f"{API_ROOT_HEURISTICS}/{yyyymm}")
-                if resp.status_code != 200:
-                    return {"error": f"folder {yyyymm} not found"}
-
-                files = resp.json()
-                match = next((f for f in files if f["name"] == file_name), None)
-                if not match:
-                    return {"error": f"heuristics file not found for {target_date}"}
-
-                # download_url を使って JSON を取得
-                raw_url = match["download_url"]
-                resp2 = requests.get(raw_url)
-                resp2.raise_for_status()
-                raw_dict = json.loads(resp2.text)
-
-                # 配列形式に変換
-                array_data = []
-                for code, tech in raw_dict.items():
-                    name = next((r["銘柄名"] for r in ticker_list if str(r["コード"]) == code), "")
-                    array_data.append({
-                        "コード": code,
-                        "銘柄名": name,
-                        **tech
-                    })
-
-                return {
-                    "target_date": target_date,
-                    "data": array_data
-                }
-
-            # ----------------------------
-            # 2. target_date が無い場合 → 最新日付を返す
-            # ----------------------------
-            resp = requests.get(API_ROOT_HEURISTICS)
-            resp.raise_for_status()
-            folders = resp.json()
-
-            ym_folders = [f["name"] for f in folders if re.match(r"^\d{6}$", f["name"])]
-            if not ym_folders:
-                return {"error": "no heuristics folders found"}
-
-            latest_ym = sorted(ym_folders)[-1]
-
-            resp2 = requests.get(f"{API_ROOT_HEURISTICS}/{latest_ym}")
-            resp2.raise_for_status()
-            files = resp2.json()
-
-            pattern = re.compile(r"^heuristics_(\d{8})\.json$")
-            dated_files = [f for f in files if pattern.match(f["name"])]
-
-            if not dated_files:
-                return {"error": "no heuristics json found in latest folder"}
-
-            latest_file = sorted(dated_files, key=lambda x: x["name"])[-1]
-            latest_date = latest_file["name"].replace("heuristics_", "").replace(".json", "")
-
-            raw_url = latest_file["download_url"]
-            resp3 = requests.get(raw_url)
-            resp3.raise_for_status()
-            raw_dict = json.loads(resp3.text)
+            raw_dict = json.loads(resp.text)
 
             array_data = []
             for code, tech in raw_dict.items():
@@ -356,7 +287,7 @@ def screening(
                 })
 
             return {
-                "target_date": latest_date,
+                "target_date": target_date,
                 "data": array_data
             }
 
