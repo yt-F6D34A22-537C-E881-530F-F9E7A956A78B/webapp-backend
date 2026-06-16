@@ -165,7 +165,7 @@ def screening(
             for row in ticker_list:
                 code = str(row["コード"])
                 name = row["銘柄名"]
-                symbol = f"{code}.T"
+                symbol = code
 
                 if symbol not in data_json:
                     continue
@@ -249,7 +249,7 @@ def screening(
             for row in ticker_list:
                 code = str(row["コード"])
                 name = row["銘柄名"]
-                symbol = f"{code}.T"
+                symbol = code
 
                 if symbol not in data_json:
                     continue
@@ -326,8 +326,10 @@ def screening(
             for code, tech in raw_dict.items():
                 code_str = str(code)
 
-                # ticker_list のコードと一致させる
-                name = next((r["銘柄名"] for r in ticker_list if str(r["コード"]) == code_str), "")
+                name = next(
+                    (r["銘柄名"] for r in ticker_list if str(r["コード"]) == code_str),
+                    ""
+                )
 
                 array_data.append({
                     "コード": code_str,
