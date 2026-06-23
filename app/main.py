@@ -39,7 +39,7 @@ def github_headers():
 # ============================
 # 外部ファイル URL（Raw）
 # ============================
-BASE_URL = "https://raw.githubusercontent.com/yt-F6D34A22-537C-E881-530F-F9E7A956A78B/batches/main/data/"
+BASE_URL = "https://raw.githubusercontent.com/yt-F6D34A22-537C-E881-530F-F9E7A956A78B/batches/refs/heads/main/data/"
 
 DATA_JSON_URL = BASE_URL + "data.json"
 EXCEL_URL = BASE_URL + "data_j.xlsx"
@@ -49,8 +49,8 @@ RAW_HEURISTICS_PREFIX = BASE_URL + "heuristics/"
 # GitHub API URL（BASE_URL から抽出）
 # ============================
 # BASE_URL 例:
-# https://raw.githubusercontent.com/<USER>/<REPO>/<BRANCH>/data/
-m = re.match(r"https://raw.githubusercontent.com/([^/]+)/([^/]+)/([^/]+)/data/", BASE_URL)
+# https://raw.githubusercontent.com/<USER>/<REPO>/<BRANCH...>/data/
+m = re.match(r"https://raw\.githubusercontent\.com/([^/]+)/([^/]+)/(.+?)/data/", BASE_URL)
 if not m:
     raise ValueError("Invalid BASE_URL format")
 
