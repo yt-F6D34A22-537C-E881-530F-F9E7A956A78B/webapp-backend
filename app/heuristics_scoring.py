@@ -1,4 +1,4 @@
-from heuristics_scoring_rules import HEURISTICS_SCORING_RULES
+from app.heuristics_scoring_rules import HEURISTICS_SCORING_RULES
 
 def calc_heuristics_score(tech: dict) -> dict:
     """
