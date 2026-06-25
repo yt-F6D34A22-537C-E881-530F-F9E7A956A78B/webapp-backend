@@ -7,7 +7,7 @@ from io import BytesIO
 import warnings
 import re
 import os
-from heuristics_scoring import calc_heuristics_score
+from app.heuristics_scoring import calc_heuristics_score
 
 import yfinance as yf
 warnings.filterwarnings("ignore")
