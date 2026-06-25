@@ -7,6 +7,7 @@ from io import BytesIO
 import warnings
 import re
 import os
+from heuristics_scoring import calc_heuristics_score
 
 import yfinance as yf
 warnings.filterwarnings("ignore")
@@ -326,19 +327,38 @@ def screening(
             for code, tech in raw_dict.items():
                 code_str = str(code)
 
+                # 銘柄名の取得
                 name = next(
                     (r["銘柄名"] for r in ticker_list if str(r["コード"]) == code_str),
                     ""
                 )
 
+                # スコアの取得
+                score = calc_heuristics_score(tech)
+
                 array_data.append({
                     "コード": code_str,
                     "銘柄名": name,
+                    "ダウンスコア": score["down"],
+                    "アップスコア": score["up"],
                     **tech
                 })
+            
+            # アップスコア降順 上位20件
+            top_up = sorted(array_data, key=lambda x: x["アップスコア"], reverse=True)[:20]
 
-            return {"status": "ok", "target_date": target_date, "data": array_data}
-
+            # ダウンスコア降順 上位20件
+            top_down = sorted(array_data, key=lambda x: x["ダウンスコア"], reverse=True)[:20]
+            
+            return {
+                "status": "ok",
+                "target_date": target_date,
+                "data": {
+                    "down": top_down,
+                    "up":   top_up,
+                }
+            }
+            
         except Exception as e:
             return {"error": "heuristics failed", "detail": str(e)}
 
@@ -408,18 +428,3 @@ def chart(ticker: str, timeframe: str = "1d"):
 
     except Exception as e:
         return {"error": "chart failed", "detail": str(e)}
-
-# ============================
-# debug_tree（trees API の生レスポンス）
-# ============================
-@app.get("/debug_tree")
-def debug_tree():
-    try:
-        resp = requests.get(GIT_TREE_API, headers=github_headers())
-        return {
-            "status": resp.status_code,
-            "url": GIT_TREE_API,
-            "json": resp.json()
-        }
-    except Exception as e:
-        return {"error": str(e)}
