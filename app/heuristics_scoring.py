@@ -1,18 +1,20 @@
 from app.heuristics_scoring_rules import HEURISTICS_SCORING_RULES
 
 def calc_heuristics_score(tech: dict) -> dict:
-    """
-    1銘柄分のtechデータを受け取り、
-    {"down": int, "up": int} を返す。
-    """
     total_down = 0
     total_up   = 0
+
+    applied_down = []
+    applied_up   = []
 
     for key, rule in HEURISTICS_SCORING_RULES.items():
         val   = tech.get(key)
         rtype = rule["type"]
 
         try:
+            down_before = total_down
+            up_before   = total_up
+
             if rtype == "str_map":
                 scores     = rule["map"].get(val, {})
                 total_down += scores.get("down", 0)
@@ -34,7 +36,6 @@ def calc_heuristics_score(tech: dict) -> dict:
                     total_up   += int(val) * rule.get("multiplier_up",   0)
 
             elif rtype == "int_threshold":
-                # 値が threshold 以上のとき固定スコアを加点
                 if isinstance(val, (int, float)) and val >= rule["threshold"]:
                     total_down += rule.get("down", 0)
                     total_up   += rule.get("up",   0)
@@ -52,14 +53,23 @@ def calc_heuristics_score(tech: dict) -> dict:
                         total_up   += bonus.get("up",   0)
 
             elif rtype == "dict_trycount":
-                # tryCount が threshold 以上のとき固定スコアを加点
                 if isinstance(val, dict):
                     try_count  = val.get("tryCount", 0) or 0
                     if try_count >= rule["threshold"]:
                         total_down += rule.get("down", 0)
                         total_up   += rule.get("up",   0)
 
+            if total_down > down_before:
+                applied_down.append(key)
+            if total_up > up_before:
+                applied_up.append(key)
+
         except Exception:
             continue
 
-    return {"down": total_down, "up": total_up}
+    return {
+        "down": total_down,
+        "up": total_up,
+        "applied_down_rules": applied_down,
+        "applied_up_rules": applied_up,
+    }
