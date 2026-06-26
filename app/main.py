@@ -360,6 +360,8 @@ def screening(
                     "銘柄名":       name,
                     "ダウンスコア": score["down"],
                     "アップスコア": score["up"],
+                    "applied_down_rules": score.get("applied_down_rules", []),
+                    "applied_up_rules":   score.get("applied_up_rules", []),
                     **tech
                 })
 
