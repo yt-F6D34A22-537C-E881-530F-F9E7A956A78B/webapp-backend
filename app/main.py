@@ -358,10 +358,10 @@ def screening(
                 array_data.append({
                     "コード":       code_str,
                     "銘柄名":       name,
-                    "ダウンスコア": score["down"],
                     "アップスコア": score["up"],
-                    "applied_down_rules": score.get("applied_down_rules", []),
+                    "ダウンスコア": score["down"],
                     "applied_up_rules":   score.get("applied_up_rules", []),
+                    "applied_down_rules": score.get("applied_down_rules", []),
                     **tech
                 })
 
@@ -372,8 +372,8 @@ def screening(
                 "status": "ok",
                 "target_date": target_date,
                 "data": {
-                    "down": top_down,
                     "up":   top_up,
+                    "down": top_down,
                 }
             }
 
