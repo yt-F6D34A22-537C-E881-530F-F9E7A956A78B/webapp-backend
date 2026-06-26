@@ -93,6 +93,15 @@ load_ticker_list()
 load_data_json()
 
 # ============================
+# ユーティリティ
+# ============================
+def parse_exclude_markets(exclude_markets: str) -> set:
+    """カンマ区切りの除外市場文字列を set に変換する"""
+    if not exclude_markets:
+        return set()
+    return {m.strip() for m in exclude_markets.split(",") if m.strip()}
+
+# ============================
 # /dates（プルダウン用）
 # ============================
 @app.get("/dates")
@@ -154,7 +163,8 @@ def screening(
     mode: str = "ratio",
     volume_ratio: float = 5,
     shadow_ratio: float = 5,
-    target_date: str = None
+    target_date: str = None,
+    exclude_markets: str = None  # カンマ区切りで除外する市場・商品区分
 ):
     results = []
 
@@ -310,6 +320,8 @@ def screening(
             return {"error": "target_date is required"}
 
         try:
+            exclude_set = parse_exclude_markets(exclude_markets)
+
             yyyymm = target_date[:6]
             raw_url = f"{RAW_HEURISTICS_PREFIX}{yyyymm}/heuristics_{target_date}.json"
 
@@ -327,29 +339,33 @@ def screening(
             for code, tech in raw_dict.items():
                 code_str = str(code)
 
-                # 銘柄名の取得
-                name = next(
-                    (r["銘柄名"] for r in ticker_list if str(r["コード"]) == code_str),
-                    ""
+                # 銘柄名・市場区分の取得
+                ticker_row = next(
+                    (r for r in ticker_list if str(r["コード"]) == code_str),
+                    None
                 )
+                if ticker_row is None:
+                    continue
 
-                # スコアの取得
+                # 除外市場フィルタ
+                market = str(ticker_row.get("市場・商品区分", ""))
+                if exclude_set and market in exclude_set:
+                    continue
+
+                name = ticker_row["銘柄名"]
                 score = calc_heuristics_score(tech)
 
                 array_data.append({
-                    "コード": code_str,
-                    "銘柄名": name,
+                    "コード":       code_str,
+                    "銘柄名":       name,
                     "ダウンスコア": score["down"],
                     "アップスコア": score["up"],
                     **tech
                 })
-            
-            # アップスコア降順 上位20件
-            top_up = sorted(array_data, key=lambda x: x["アップスコア"], reverse=True)[:20]
 
-            # ダウンスコア降順 上位20件
+            top_up   = sorted(array_data, key=lambda x: x["アップスコア"], reverse=True)[:20]
             top_down = sorted(array_data, key=lambda x: x["ダウンスコア"], reverse=True)[:20]
-            
+
             return {
                 "status": "ok",
                 "target_date": target_date,
@@ -358,7 +374,7 @@ def screening(
                     "up":   top_up,
                 }
             }
-            
+
         except Exception as e:
             return {"error": "heuristics failed", "detail": str(e)}
 
