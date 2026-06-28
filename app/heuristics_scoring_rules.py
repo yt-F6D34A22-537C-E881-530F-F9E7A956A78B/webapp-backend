@@ -266,6 +266,8 @@ HEURISTICS_SCORING_RULES: dict[str, dict] = {
 
     # =========================================================
     # 9の法則
+    # count_threshold: 9以上で反転シグナル（ボーナス加点）
+    # count_bonus: 上昇9以上→下落加点、下降9以上→上昇加点（逆張り）
     # =========================================================
     "TECH_RULE9_DAILY": {
         "type": "dict_direction",
@@ -273,12 +275,22 @@ HEURISTICS_SCORING_RULES: dict[str, dict] = {
             "down": {"down": 3},
             "up":   {"up": 3},
         },
+        "count_threshold": 9,
+        "count_bonus": {
+            "down": 2,
+            "up":   2,
+        },
     },
     "TECH_RULE9_WEEKLY": {
         "type": "dict_direction",
         "map": {
             "down": {"down": 3},
             "up":   {"up": 3},
+        },
+        "count_threshold": 9,
+        "count_bonus": {
+            "down": 2,
+            "up":   2,
         },
     },
 
@@ -316,6 +328,7 @@ HEURISTICS_SCORING_RULES: dict[str, dict] = {
 
     # =========================================================
     # グランビル
+    # count_threshold: 第3法則（乖離過大）以上でボーナス加点
     # =========================================================
     "TECH_GRANVILLE": {
         "type": "dict_direction",
@@ -323,15 +336,24 @@ HEURISTICS_SCORING_RULES: dict[str, dict] = {
             "down": {"down": 3},
             "up":   {"up": 3},
         },
+        "count_threshold": 3,
+        "count_bonus": {
+            "down": 1,
+            "up":   1,
+        },
     },
 
     # =========================================================
     # トレンドサイクル進行度
+    # direction: "up"=上昇サイクル中, "down"=下降サイクル中
+    # count: サイクル起点からの経過営業日数
     # =========================================================
     "TECH_CYCLE_PROGRESS": {
-        "type": "int_threshold",
-        "threshold": 60,
-        "up": 2,
+        "type": "dict_direction",
+        "map": {
+            "up":   {"up":   2},
+            "down": {"down": 2},
+        },
     },
 
     # =========================================================
