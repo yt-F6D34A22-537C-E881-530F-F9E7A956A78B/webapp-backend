@@ -101,6 +101,44 @@ def parse_exclude_markets(exclude_markets: str) -> set:
         return set()
     return {m.strip() for m in exclude_markets.split(",") if m.strip()}
 
+def fetch_close_price(code: str, date: str) -> float | None:
+    """
+    指定銘柄コードの指定日（YYYYMMDD）の終値を取得する。
+    data.json の保持範囲（直近10日）を超える日付にも対応するため
+    yfinance から個別取得する。
+    """
+    try:
+        symbol = f"{code}.T"
+        target = pd.to_datetime(date, format="%Y%m%d")
+        # 土日祝を跨ぐ可能性を考慮し前後の余裕を持たせて取得
+        df = yf.download(
+            symbol,
+            start=target - pd.Timedelta(days=7),
+            end=target + pd.Timedelta(days=1),
+            interval="1d",
+            progress=False,
+        )
+        if df.empty:
+            return None
+
+        if isinstance(df.columns, pd.MultiIndex):
+            try:
+                df = df.xs(symbol, level=1, axis=1)
+            except Exception:
+                pass
+
+        df.index = pd.to_datetime(df.index, errors="coerce")
+        df = df.dropna(subset=["Close"])
+
+        match = df[df.index.strftime("%Y%m%d") == date]
+        if match.empty:
+            return None
+
+        return round(float(match["Close"].iloc[0]), 2)
+
+    except Exception:
+        return None
+
 # ============================
 # /dates（プルダウン用）
 # ============================
@@ -164,7 +202,11 @@ def screening(
     volume_ratio: float = 5,
     shadow_ratio: float = 5,
     target_date: str = None,
-    exclude_markets: str = None  # カンマ区切りで除外する市場・商品区分
+    exclude_markets: str = None,  # カンマ区切りで除外する市場・商品区分
+    from_date: str = None,        # compare モード用：比較元日付
+    to_date: str = None,          # compare モード用：比較先日付
+    codes: str = None,            # compare モード用：証券コード（カンマ区切り）
+    source_mode: str = None,      # compare モード用：CSV元モード（ratio/date/heuristics/空）
 ):
     results = []
 
@@ -379,6 +421,82 @@ def screening(
 
         except Exception as e:
             return {"error": "heuristics failed", "detail": str(e)}
+
+    # ----------------------------
+    # モード D：CSV/証券コード比較
+    # ----------------------------
+    elif mode == "compare":
+        if not from_date or not to_date:
+            return {"error": "from_date and to_date are required"}
+
+        try:
+            codes_list = [c.strip() for c in (codes or "").split(",") if c.strip()]
+            if not codes_list:
+                return {"error": "codes is required"}
+
+            # source_mode に応じた予測ロジックの切替
+            # - ratio（出来高×上髭）: 全件「上昇」予測
+            # - date（値上がり率ランキング）: 予測なし
+            # - heuristics: from_date 時点の heuristics JSON からトレンドを取得
+            # - 証券コード直接入力（source_mode未指定）: 予測なし
+            heuristics_trend_map = {}
+            if source_mode == "heuristics":
+                yyyymm = from_date[:6]
+                raw_url = f"{RAW_HEURISTICS_PREFIX}{yyyymm}/heuristics_{from_date}.json"
+                resp = requests.get(raw_url, headers=github_headers())
+                if resp.status_code == 200:
+                    raw_dict = json.loads(resp.text)
+                    for code, tech in raw_dict.items():
+                        score = calc_heuristics_score(tech)
+                        heuristics_trend_map[str(code)] = (
+                            "up" if score["up"] >= score["down"] else "down"
+                        )
+
+            for code in codes_list:
+                ticker_row = next(
+                    (r for r in ticker_list if str(r["コード"]) == code),
+                    None
+                )
+                if ticker_row is None:
+                    continue
+                name = ticker_row["銘柄名"]
+
+                from_close = fetch_close_price(code, from_date)
+                to_close = fetch_close_price(code, to_date)
+
+                if from_close is None or to_close is None:
+                    results.append({
+                        "コード": code,
+                        "銘柄名": name,
+                        "error": "終値データを取得できませんでした",
+                    })
+                    continue
+
+                diff_yen = round(to_close - from_close, 2)
+                diff_pct = round((to_close - from_close) / from_close * 100, 2) if from_close else None
+
+                if source_mode == "ratio":
+                    prediction = "up"
+                elif source_mode == "heuristics":
+                    prediction = heuristics_trend_map.get(code)
+                else:
+                    # "date"（値上がり率ランキング）または証券コード直接入力
+                    prediction = None
+
+                results.append({
+                    "コード": code,
+                    "銘柄名": name,
+                    "比較元終値": from_close,
+                    "比較先終値": to_close,
+                    "増減円": diff_yen,
+                    "増減率": diff_pct,
+                    "予測": prediction,
+                })
+
+            return {"status": "ok", "data": results}
+
+        except Exception as e:
+            return {"error": "compare failed", "detail": str(e)}
 
     else:
         return {"error": "invalid mode"}
