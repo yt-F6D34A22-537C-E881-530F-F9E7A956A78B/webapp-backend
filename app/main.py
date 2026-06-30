@@ -156,6 +156,32 @@ def get_dates():
         return {"error": "failed to load dates", "detail": str(e)}
 
 # ============================
+# /trading_dates（compare モードの比較元日付用）
+# ============================
+@app.get("/trading_dates")
+def get_trading_dates():
+    """
+    直近3か月の市場開場日一覧を返す。
+    data.json は直近10日分のみ保持のため、より長期間の開場日カレンダーが
+    必要な compare モードの比較元日付セレクタ用に、
+    yfinance から代表銘柄（日経平均株価指数）の日足を取得して開場日を算出する。
+    """
+    try:
+        index_symbol = "^N225"
+        df = yf.download(index_symbol, period="3mo", interval="1d", progress=False)
+        if df.empty:
+            return {"error": "no trading date data"}
+
+        df.index = pd.to_datetime(df.index, errors="coerce")
+        df = df.dropna(how="all")
+
+        trading_dates = sorted(df.index.strftime("%Y%m%d").tolist(), reverse=True)
+        return {"status": "ok", "dates": trading_dates}
+
+    except Exception as e:
+        return {"error": "failed to load trading dates", "detail": str(e)}
+
+# ============================
 # /heuristics_dates
 # ============================
 @app.get("/heuristics_dates")
@@ -203,9 +229,9 @@ def screening(
     shadow_ratio: float = 5,
     target_date: str = None,
     exclude_markets: str = None,  # カンマ区切りで除外する市場・商品区分
+    codes: str = None,            # heuristics 絞り込み／compare 対象銘柄（カンマ区切り）
     from_date: str = None,        # compare モード用：比較元日付
     to_date: str = None,          # compare モード用：比較先日付
-    codes: str = None,            # compare モード用：証券コード（カンマ区切り）
     source_mode: str = None,      # compare モード用：CSV元モード（ratio/date/heuristics/空）
 ):
     results = []
