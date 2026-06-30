@@ -407,6 +407,24 @@ def screening(
                     **tech
                 })
 
+            # 証券コードによる絞り込み（指定時は上位20件制限を行わず全件返却）
+            codes_filter = [c.strip() for c in (codes or "").split(",") if c.strip()]
+
+            if codes_filter:
+                filtered = [d for d in array_data if d["コード"] in codes_filter]
+                # その証券コードのトレンド（アップ/ダウンスコアの大きい方）を設定
+                for d in filtered:
+                    d["トレンド"] = "up" if d["アップスコア"] >= d["ダウンスコア"] else "down"
+
+                return {
+                    "status": "ok",
+                    "target_date": target_date,
+                    "data": {
+                        "up":   [d for d in filtered if d["トレンド"] == "up"],
+                        "down": [d for d in filtered if d["トレンド"] == "down"],
+                    }
+                }
+
             top_up   = sorted(array_data, key=lambda x: x["アップスコア"], reverse=True)[:20]
             top_down = sorted(array_data, key=lambda x: x["ダウンスコア"], reverse=True)[:20]
 
