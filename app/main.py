@@ -241,10 +241,17 @@ def screening(
     # ----------------------------
     if mode == "ratio":
         try:
+            exclude_set = parse_exclude_markets(exclude_markets)
+
             for row in ticker_list:
                 code = str(row["コード"])
                 name = row["銘柄名"]
                 symbol = code
+
+                # 除外市場フィルタ（heuristics モードと同一ロジック）
+                market = str(row.get("市場・商品区分", ""))
+                if exclude_set and market in exclude_set:
+                    continue
 
                 if symbol not in data_json:
                     continue
