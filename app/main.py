@@ -67,6 +67,7 @@ GIT_TREE_API = f"https://api.github.com/repos/{repo_user}/{repo_name}/git/trees/
 # ============================
 ticker_list = []
 data_json = {}
+trading_dates_cache = []  # /trading_dates 用（3か月分の市場開場日。起動時に1回だけ取得）
 
 def load_ticker_list():
     global ticker_list
@@ -89,8 +90,35 @@ def load_data_json():
         print("Failed to load data.json:", e)
         data_json = {}
 
+def load_trading_dates():
+    """
+    直近3か月の市場開場日一覧を取得し、trading_dates_cache に格納する。
+    yfinance によるYahoo Financeへの外部通信は数秒〜十数秒かかることがあり、
+    これをリクエスト処理のたびに行うと、Renderのコールドスタート（dyno起動）に
+    かかる時間と合算してタイムアウトしてしまう不具合があった（2026-07 修正）。
+    load_ticker_list() / load_data_json() と同様に、起動時（モジュール読み込み時）に
+    1回だけ実行してキャッシュし、/trading_dates はキャッシュを返すだけにする。
+    """
+    global trading_dates_cache
+    try:
+        index_symbol = "^N225"
+        df = yf.download(index_symbol, period="3mo", interval="1d", progress=False)
+        if df.empty:
+            print("Failed to load trading dates: empty data")
+            trading_dates_cache = []
+            return
+
+        df.index = pd.to_datetime(df.index, errors="coerce")
+        df = df.dropna(how="all")
+
+        trading_dates_cache = sorted(df.index.strftime("%Y%m%d").tolist(), reverse=True)
+    except Exception as e:
+        print("Failed to load trading dates:", e)
+        trading_dates_cache = []
+
 load_ticker_list()
 load_data_json()
+load_trading_dates()
 
 # ============================
 # ユーティリティ
@@ -164,20 +192,17 @@ def get_trading_dates():
     直近3か月の市場開場日一覧を返す。
     data.json は直近10日分のみ保持のため、より長期間の開場日カレンダーが
     必要な compare モードの比較元日付セレクタ用に、
-    yfinance から代表銘柄（日経平均株価指数）の日足を取得して開場日を算出する。
+    起動時（モジュール読み込み時）に load_trading_dates() で1回だけ取得した
+    trading_dates_cache を返す（2026-07 修正。以前はリクエスト毎に
+    yfinance へ問い合わせていたが、Renderのコールドスタート時に
+    起動遅延と外部通信時間が合算してタイムアウトする不具合があったため、
+    /dates（data_json）と同じ「起動時に1回だけ取得してキャッシュする」
+    方式に統一した）。
     """
     try:
-        index_symbol = "^N225"
-        df = yf.download(index_symbol, period="3mo", interval="1d", progress=False)
-        if df.empty:
+        if not trading_dates_cache:
             return {"error": "no trading date data"}
-
-        df.index = pd.to_datetime(df.index, errors="coerce")
-        df = df.dropna(how="all")
-
-        trading_dates = sorted(df.index.strftime("%Y%m%d").tolist(), reverse=True)
-        return {"status": "ok", "dates": trading_dates}
-
+        return {"status": "ok", "dates": trading_dates_cache}
     except Exception as e:
         return {"error": "failed to load trading dates", "detail": str(e)}
 
