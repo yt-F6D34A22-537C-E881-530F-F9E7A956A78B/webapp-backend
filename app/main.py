@@ -198,8 +198,19 @@ def get_trading_dates():
     起動遅延と外部通信時間が合算してタイムアウトする不具合があったため、
     /dates（data_json）と同じ「起動時に1回だけ取得してキャッシュする」
     方式に統一した）。
+    ただし、起動時の取得自体が外部通信の失敗で空振りした場合、リトライが
+    一切行われず、プロセスが再起動されるまで永久に失敗し続ける不具合が
+    あったため、2026-07 にキャッシュが空の場合のみリクエスト時にその場で
+    再取得を試みるフォールバックを追加した。これにより、キャッシュ済みの
+    通常時は高速な応答を維持しつつ、起動時取得が失敗した場合でも
+    次のリクエストで自己回復できるようにしている
+    （元々の「コールドスタート時のみ失敗し、その後のリロードでは
+    正常に取得できる」という挙動に近い形に戻している）。
     """
+    global trading_dates_cache
     try:
+        if not trading_dates_cache:
+            load_trading_dates()
         if not trading_dates_cache:
             return {"error": "no trading date data"}
         return {"status": "ok", "dates": trading_dates_cache}
