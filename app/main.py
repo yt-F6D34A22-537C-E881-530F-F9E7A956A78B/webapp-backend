@@ -7,6 +7,7 @@ from io import BytesIO
 import warnings
 import re
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from app.heuristics_scoring import calc_heuristics_score
 
 import yfinance as yf
@@ -129,6 +130,11 @@ def parse_exclude_markets(exclude_markets: str) -> set:
         return set()
     return {m.strip() for m in exclude_markets.split(",") if m.strip()}
 
+# compare モード：銘柄ごとの終値取得（yfinance 通信）を並列実行する際の
+# 最大同時実行数。大きくしすぎると Yahoo Finance 側のレート制限に
+# 抵触しやすくなるため、あえて小さめの値に固定している。
+COMPARE_FETCH_MAX_WORKERS = 8
+
 def fetch_close_price(code: str, date: str) -> float | None:
     """
     指定銘柄コードの指定日（YYYYMMDD）の終値を取得する。
@@ -166,6 +172,62 @@ def fetch_close_price(code: str, date: str) -> float | None:
 
     except Exception:
         return None
+
+def fetch_close_prices_range(code: str, from_date: str, to_date: str) -> dict[str, float]:
+    """
+    指定銘柄コードの from_date〜to_date（両端含む）の終値を、
+    yfinance から1回の呼び出しでまとめて取得する。
+    compare モードの all_market_days=true（全営業日比較）専用。
+    fetch_close_price(code, date) を対象日数ぶんループすると
+    銘柄数×対象日数の外部通信が発生し、Yahoo Finance のレート制限や
+    Renderのタイムアウトを招くリスクが高いため、範囲取得1回に集約する
+    （/trading_dates が同様の理由でキャッシュ化された経緯と同じ配慮）。
+    取得失敗時は空 dict を返す。
+    """
+    try:
+        symbol = f"{code}.T"
+        start = pd.to_datetime(from_date, format="%Y%m%d")
+        end = pd.to_datetime(to_date, format="%Y%m%d") + pd.Timedelta(days=1)
+
+        df = yf.download(symbol, start=start, end=end, interval="1d", progress=False)
+        if df.empty:
+            return {}
+
+        if isinstance(df.columns, pd.MultiIndex):
+            try:
+                df = df.xs(symbol, level=1, axis=1)
+            except Exception:
+                pass
+
+        df.index = pd.to_datetime(df.index, errors="coerce")
+        df = df.dropna(subset=["Close"])
+
+        return {
+            d: round(float(c), 2)
+            for d, c in zip(df.index.strftime("%Y%m%d"), df["Close"])
+        }
+    except Exception:
+        return {}
+
+def _fetch_compare_prices(code: str, from_date: str, to_date: str, all_market_days: bool):
+    """
+    compare モード：1銘柄ぶんの終値取得（I/O部分のみ）。
+    ThreadPoolExecutor から並列に呼び出されることを前提とした関数のため、
+    ticker_list 照合や予測ロジックなど、外部通信を伴わない処理は含めない
+    （それらは呼び出し側で従来通り直列に行う）。
+    戻り値: (from_close, close_map)
+      - all_market_days=False: close_map は {to_date: to_close}（取得失敗時は空 dict）
+      - all_market_days=True : close_map は fetch_close_prices_range の結果
+    """
+    from_close = fetch_close_price(code, from_date)
+
+    if all_market_days:
+        close_map = fetch_close_prices_range(code, from_date, to_date)
+    else:
+        to_close = fetch_close_price(code, to_date)
+        close_map = {to_date: to_close} if to_close is not None else {}
+
+    return from_close, close_map
 
 # ============================
 # /dates（プルダウン用）
@@ -269,6 +331,9 @@ def screening(
     from_date: str = None,        # compare モード用：比較元日付
     to_date: str = None,          # compare モード用：比較先日付
     source_mode: str = None,      # compare モード用：CSV元モード（ratio/date/heuristics/空）
+    all_market_days: bool = False,  # compare モード用：true の場合、比較元日付を基準に
+                                     # 比較先日付までの全市場開場日と比較する
+                                     # （既定 false ＝従来通りの2点比較。省略時は無改修で動作）
 ):
     results = []
 
@@ -539,6 +604,24 @@ def screening(
                             "up" if score["up"] >= score["down"] else "down"
                         )
 
+            # 全営業日比較モード（all_market_days=true）の対象日付一覧。
+            # 比較元日付（from_date）自身は含めない（差分が常に0になるため）。
+            # #compareFromDate・#compareToDateSelect の選択肢自体が
+            # /trading_dates（＝この trading_dates_cache）から構築されているため、
+            # 範囲内の日付はキャッシュのみで求まり、追加の外部通信は発生しない。
+            all_market_dates = []
+            if all_market_days:
+                all_market_dates = sorted(
+                    d for d in trading_dates_cache
+                    if from_date < d <= to_date
+                )
+                if not all_market_dates:
+                    return {"error": "no trading days between from_date and to_date"}
+
+            # ticker_list 照合を先に済ませ、無効な証券コードには
+            # yfinance への通信を発生させない（従来の挙動を踏襲）
+            valid_codes = []
+            code_name_map = {}
             for code in codes_list:
                 ticker_row = next(
                     (r for r in ticker_list if str(r["コード"]) == code),
@@ -546,12 +629,91 @@ def screening(
                 )
                 if ticker_row is None:
                     continue
-                name = ticker_row["銘柄名"]
+                valid_codes.append(code)
+                code_name_map[code] = ticker_row["銘柄名"]
 
-                from_close = fetch_close_price(code, from_date)
-                to_close = fetch_close_price(code, to_date)
+            # 銘柄ごとの終値取得（yfinance 通信）を並列実行する。
+            # 直列ループだと「1銘柄あたりの通信時間 × 銘柄数」がそのまま
+            # レスポンス時間になっていたが、各銘柄の取得は互いに独立しているため
+            # ThreadPoolExecutor で並列化することでレスポンス時間を短縮できる。
+            # 結果は codes_list の順序を保つため、一旦 price_data に集約してから
+            # valid_codes の順で結果を組み立てる（futures の完了順=結果の並び順にはしない）。
+            price_data = {}
+            if valid_codes:
+                with ThreadPoolExecutor(
+                    max_workers=min(COMPARE_FETCH_MAX_WORKERS, len(valid_codes))
+                ) as executor:
+                    futures = {
+                        executor.submit(
+                            _fetch_compare_prices, code, from_date, to_date, all_market_days
+                        ): code
+                        for code in valid_codes
+                    }
+                    for future in as_completed(futures):
+                        code = futures[future]
+                        try:
+                            price_data[code] = future.result()
+                        except Exception:
+                            # 1銘柄の取得失敗が他銘柄に波及しないよう、
+                            # 個別に失敗扱い（取得できなかった場合と同じ状態）にする
+                            price_data[code] = (None, {})
 
-                if from_close is None or to_close is None:
+            for code in valid_codes:
+                name = code_name_map[code]
+                from_close, close_map = price_data.get(code, (None, {}))
+
+                if from_close is None:
+                    results.append({
+                        "コード": code,
+                        "銘柄名": name,
+                        "error": "終値データを取得できませんでした",
+                    })
+                    continue
+
+                if source_mode == "ratio":
+                    prediction = "up"
+                elif source_mode == "heuristics":
+                    prediction = heuristics_trend_map.get(code)
+                else:
+                    # "date"（値上がり率ランキング）または証券コード直接入力
+                    prediction = None
+
+                # ------------------------------
+                # 全営業日比較モード
+                # ------------------------------
+                if all_market_days:
+                    for target_date in all_market_dates:
+                        to_close = close_map.get(target_date)
+                        if to_close is None:
+                            results.append({
+                                "コード": code,
+                                "銘柄名": name,
+                                "比較先日付": target_date,
+                                "error": "終値データを取得できませんでした",
+                            })
+                            continue
+
+                        diff_yen = round(to_close - from_close, 2)
+                        diff_pct = round((to_close - from_close) / from_close * 100, 2) if from_close else None
+
+                        results.append({
+                            "コード": code,
+                            "銘柄名": name,
+                            "比較先日付": target_date,
+                            "比較元終値": from_close,
+                            "比較先終値": to_close,
+                            "増減円": diff_yen,
+                            "増減率": diff_pct,
+                            "予測": prediction,
+                        })
+                    continue
+
+                # ------------------------------
+                # 既存：単一比較モード（挙動変更なし）
+                # ------------------------------
+                to_close = close_map.get(to_date)
+
+                if to_close is None:
                     results.append({
                         "コード": code,
                         "銘柄名": name,
@@ -561,14 +723,6 @@ def screening(
 
                 diff_yen = round(to_close - from_close, 2)
                 diff_pct = round((to_close - from_close) / from_close * 100, 2) if from_close else None
-
-                if source_mode == "ratio":
-                    prediction = "up"
-                elif source_mode == "heuristics":
-                    prediction = heuristics_trend_map.get(code)
-                else:
-                    # "date"（値上がり率ランキング）または証券コード直接入力
-                    prediction = None
 
                 results.append({
                     "コード": code,
