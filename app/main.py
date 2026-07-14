@@ -685,10 +685,15 @@ def screening(
                     for target_date in all_market_dates:
                         to_close = close_map.get(target_date)
                         if to_close is None:
+                            # 比較元終値・予測は取得済みのため、対象日の終値のみ欠落した
+                            # 状態として結果に含める（フロントの横持ち表示で比較元終値の
+                            # 固定列を空白にしないため。2026-07 追加）
                             results.append({
                                 "コード": code,
                                 "銘柄名": name,
                                 "比較先日付": target_date,
+                                "比較元終値": from_close,
+                                "予測": prediction,
                                 "error": "終値データを取得できませんでした",
                             })
                             continue
@@ -714,9 +719,14 @@ def screening(
                 to_close = close_map.get(to_date)
 
                 if to_close is None:
+                    # 比較元終値・予測は取得済みのため、比較先終値のみ欠落した状態として
+                    # 結果に含める（フロントの横持ち表示で比較元終値の固定列を
+                    # 空白にしないため。2026-07 追加）
                     results.append({
                         "コード": code,
                         "銘柄名": name,
+                        "比較元終値": from_close,
+                        "予測": prediction,
                         "error": "終値データを取得できませんでした",
                     })
                     continue
