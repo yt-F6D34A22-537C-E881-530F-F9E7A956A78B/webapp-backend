@@ -230,6 +230,111 @@ def _fetch_compare_prices(code: str, from_date: str, to_date: str, all_market_da
     return from_close, close_map
 
 # ============================
+# block モード（超大口検出）
+# ============================
+# 銘柄ごとの1分足取得（yfinance 通信）を並列実行する際の最大同時実行数。
+# compare モードと同様、Yahoo Finance 側のレート制限を考慮して小さめに固定する。
+BLOCK_FETCH_MAX_WORKERS = 8
+
+# 単一バーの推定売買代金がこの金額（円）以上の場合に「超大口の可能性あり」と判定する
+# デフォルト値（歩み値ベースの目視判断で使われていた「1億円」を踏襲）
+BLOCK_TRADE_DEFAULT_THRESHOLD_YEN = 100_000_000
+
+# 一次スクリーニング（日次売買代金ランキング）で1分足取得の対象とする候補数の既定値。
+# 大きくするほど検出漏れは減るが、1分足取得（外部通信）の回数が比例して増える。
+BLOCK_CANDIDATE_DEFAULT_LIMIT = 50
+
+# 1分足が取得できるのは直近7日程度という Yahoo Finance 側の制約があるため、
+# target_date はこの制約に収まる日付のみ受け付ける。
+# trading_dates_cache は降順（新しい日付が先頭）なので、
+# 先頭から数件が「1分足取得が期待できる」対象日となる。
+# 7日ではなく6営業日としているのは、Yahoo側の「直近7日」が暦日ベースであるのに対し
+# trading_dates_cache は営業日ベースのため、境界付近での取得失敗（休日を挟んで
+# 7営業日 > 7暦日 になるケース）を避けるための安全マージン。
+BLOCK_RECENT_TRADABLE_DAYS = 6
+
+def fetch_1m_bars(code: str, target_date: str) -> pd.DataFrame | None:
+    """
+    指定銘柄コードの指定日（YYYYMMDD）の1分足（Open/High/Low/Close/Volume）を取得する。
+    yfinance の 1分足は Yahoo Finance 側の制約により直近7日程度しか取得できない
+    （BLOCK_RECENT_TRADABLE_DAYS を参照）。取得失敗・データなしの場合は None を返す。
+    """
+    try:
+        symbol = f"{code}.T"
+        target = pd.to_datetime(target_date, format="%Y%m%d")
+        df = yf.download(
+            symbol,
+            start=target,
+            end=target + pd.Timedelta(days=1),
+            interval="1m",
+            progress=False,
+        )
+        if df.empty:
+            return None
+
+        if isinstance(df.columns, pd.MultiIndex):
+            try:
+                df = df.xs(symbol, level=1, axis=1)
+            except Exception:
+                pass
+
+        df = df.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
+        if df.empty:
+            return None
+
+        return df
+    except Exception:
+        return None
+
+def detect_block_bars(df: pd.DataFrame, threshold_yen: float) -> pd.DataFrame:
+    """
+    1分足DataFrameから、単一バーの推定売買代金が threshold_yen 以上のバーを抽出する。
+    歩み値（個々の約定）は取得できないため、「出来高 × バー内の代表値
+    （高値・安値・終値の平均＝いわゆる typical price）」を1分間の約定代金の近似値として扱う。
+    該当バーがなければ空のDataFrameを返す。
+    """
+    typical_price = (df["High"] + df["Low"] + df["Close"]) / 3
+    bar_value = df["Volume"] * typical_price
+
+    hits = df[bar_value >= threshold_yen].copy()
+    if hits.empty:
+        return hits
+
+    hits["bar_value"] = bar_value[bar_value >= threshold_yen]
+    hits["price_change_pct"] = (hits["Close"] - hits["Open"]) / hits["Open"] * 100
+    return hits
+
+def _fetch_block_detection(code: str, target_date: str, threshold_yen: float):
+    """
+    block モード：1銘柄ぶんの1分足取得・検出処理（I/O部分を含む）。
+    ThreadPoolExecutor から並列に呼び出されることを前提とした関数。
+    該当バーがなければ None を返す（超大口の兆候なし＝結果に含めない）。
+    """
+    df = fetch_1m_bars(code, target_date)
+    if df is None:
+        return None
+
+    hits = detect_block_bars(df, threshold_yen)
+    if hits.empty:
+        return None
+
+    # 単一バーの推定売買代金が最大の1本を代表値として採用する
+    max_row = hits.loc[hits["bar_value"].idxmax()]
+
+    # 価格変化率の絶対値が大きい（値を飛ばして約定させた）ほど「顕在的な大口」、
+    # 小さい（値をほぼ動かさずに吸収した）ほど「潜在的な大口（吸収）」寄りと解釈する。
+    # 0.3% は目視判断の目安として置いた暫定値であり、確定的な閾値ではない。
+    trade_type = "値飛ばし" if abs(max_row["price_change_pct"]) >= 0.3 else "吸収"
+
+    return {
+        "検出件数": int(len(hits)),
+        "最大売買代金": round(float(max_row["bar_value"]), 0),
+        "検出時刻": max_row.name.strftime("%H:%M"),
+        "価格変化率": round(float(max_row["price_change_pct"]), 2),
+        "タイプ": trade_type,
+    }
+
+# ============================
 # /dates（プルダウン用）
 # ============================
 @app.get("/dates")
@@ -334,6 +439,8 @@ def screening(
     all_market_days: bool = False,  # compare モード用：true の場合、比較元日付を基準に
                                      # 比較先日付までの全市場開場日と比較する
                                      # （既定 false ＝従来通りの2点比較。省略時は無改修で動作）
+    threshold_yen: float = None,    # block モード用：単一バーの推定売買代金の検出閾値（円）
+    candidate_limit: int = None,    # block モード用：1分足取得の対象とする候補数（日次売買代金上位）
 ):
     results = []
 
@@ -748,6 +855,104 @@ def screening(
 
         except Exception as e:
             return {"error": "compare failed", "detail": str(e)}
+
+    # ----------------------------
+    # モード E：超大口検出（block）
+    # ----------------------------
+    elif mode == "block":
+        if not target_date:
+            return {"error": "target_date is required"}
+
+        # 1分足は直近7日程度しか取得できない（Yahoo Finance 側の制約）ため、
+        # 対象外の日付は1分足取得を試みる前に弾く（詳細は BLOCK_RECENT_TRADABLE_DAYS を参照）
+        recent_tradable_dates = set(trading_dates_cache[:BLOCK_RECENT_TRADABLE_DAYS])
+        if target_date not in recent_tradable_dates:
+            return {
+                "error": "target_date is out of range for 1-minute data",
+                "detail": "1分足データは直近の取引日のみ取得可能です。直近の日付を選択してください。",
+            }
+
+        try:
+            exclude_set = parse_exclude_markets(exclude_markets)
+            threshold = threshold_yen if threshold_yen else BLOCK_TRADE_DEFAULT_THRESHOLD_YEN
+            limit = candidate_limit if candidate_limit else BLOCK_CANDIDATE_DEFAULT_LIMIT
+
+            # ------------------------------
+            # 一次スクリーニング：日次売買代金（出来高×終値）による候補絞り込み
+            # data.json のみを用いた in-memory 処理のため外部通信は発生しない。
+            # 全銘柄（約4000銘柄）に対して毎回1分足を取得するのは非現実的
+            # （Yahoo Finance のレート制限・応答時間の両面で）なため、
+            # まずこの安価な処理で候補を上位 limit 件に絞り込む。
+            # ------------------------------
+            candidates = []
+            for row in ticker_list:
+                code = str(row["コード"])
+                name = row["銘柄名"]
+
+                market = str(row.get("市場・商品区分", ""))
+                if exclude_set and market in exclude_set:
+                    continue
+
+                entry = data_json.get(code)
+                if not isinstance(entry, dict):
+                    continue
+
+                day = entry.get(target_date)
+                if not day:
+                    continue
+
+                volume = day.get("v")
+                close = day.get("c")
+                if not volume or not close:
+                    continue
+
+                candidates.append({
+                    "コード": code,
+                    "銘柄名": name,
+                    "日次売買代金": volume * close,
+                })
+
+            candidates.sort(key=lambda x: x["日次売買代金"], reverse=True)
+            candidates = candidates[:limit]
+
+            if not candidates:
+                return {"status": "ok", "data": []}
+
+            # ------------------------------
+            # 二次検査：候補銘柄のみ1分足を並列取得し、単一バーの売買代金を検査する
+            # ------------------------------
+            results = []
+            with ThreadPoolExecutor(
+                max_workers=min(BLOCK_FETCH_MAX_WORKERS, len(candidates))
+            ) as executor:
+                futures = {
+                    executor.submit(
+                        _fetch_block_detection, c["コード"], target_date, threshold
+                    ): c
+                    for c in candidates
+                }
+                for future in as_completed(futures):
+                    cand = futures[future]
+                    try:
+                        detection = future.result()
+                    except Exception:
+                        detection = None
+
+                    if detection is None:
+                        continue  # 該当バーなし（超大口の兆候なし）＝結果に含めない
+
+                    results.append({
+                        "コード": cand["コード"],
+                        "銘柄名": cand["銘柄名"],
+                        "日次売買代金": round(cand["日次売買代金"], 0),
+                        **detection,
+                    })
+
+            results.sort(key=lambda x: x["最大売買代金"], reverse=True)
+            return {"status": "ok", "data": results}
+
+        except Exception as e:
+            return {"error": "block screening failed", "detail": str(e)}
 
     else:
         return {"error": "invalid mode"}
