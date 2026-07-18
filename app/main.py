@@ -46,6 +46,7 @@ BASE_URL = "https://raw.githubusercontent.com/yt-F6D34A22-537C-E881-530F-F9E7A95
 DATA_JSON_URL = BASE_URL + "data.json"
 EXCEL_URL = BASE_URL + "data_j.xlsx"
 RAW_HEURISTICS_PREFIX = BASE_URL + "heuristics/"
+MARKET_CAP_JSON_URL = BASE_URL + "market_cap.json"  # {コード: 発行済株式数} 形式（2026-07 追加）
 
 # ============================
 # GitHub API URL（BASE_URL から抽出）
@@ -68,6 +69,7 @@ GIT_TREE_API = f"https://api.github.com/repos/{repo_user}/{repo_name}/git/trees/
 # ============================
 ticker_list = []
 data_json = {}
+market_cap_json = {}    # {コード: 発行済株式数}。2026-07 追加（時価総額列のため）
 trading_dates_cache = []  # /trading_dates 用（3か月分の市場開場日。起動時に1回だけ取得）
 
 def load_ticker_list():
@@ -90,6 +92,40 @@ def load_data_json():
     except Exception as e:
         print("Failed to load data.json:", e)
         data_json = {}
+
+def load_market_cap():
+    """
+    銘柄ごとの発行済株式数（{コード: 株数}）を market_cap.json から読み込む。
+    発行済株式数は株式分割・自己株買い等がなければ短期間では変化しないため、
+    data.json（日次更新）とは別に、低頻度（週次を想定）で更新される
+    市場データを想定している。生成は scripts/fetch_market_cap.py・
+    .github/workflows/market_cap.yml を参照。
+    時価総額そのもの（円建ての金額）ではなく株数を保持するのは、
+    日々変動する終値と組み合わせて時価総額を都度計算するため
+    （時価総額を直接保存すると、株価が動くたびに再生成が必要になり非効率）。
+    """
+    global market_cap_json
+    try:
+        resp = requests.get(MARKET_CAP_JSON_URL)
+        resp.raise_for_status()
+        market_cap_json = json.loads(resp.text)
+    except Exception as e:
+        print("Failed to load market_cap.json:", e)
+        market_cap_json = {}
+
+def calc_market_cap(code: str, price) -> float | None:
+    """
+    銘柄コードと株価から時価総額（円）を算出する。
+    発行済株式数が market_cap_json に存在しない、または price が不正な場合は None を返す
+    （フロント側は None を「-」として表示する）。
+    """
+    try:
+        shares = market_cap_json.get(str(code))
+        if not shares or price is None:
+            return None
+        return round(shares * price, 0)
+    except Exception:
+        return None
 
 def load_trading_dates():
     """
@@ -119,6 +155,7 @@ def load_trading_dates():
 
 load_ticker_list()
 load_data_json()
+load_market_cap()
 load_trading_dates()
 
 # ============================
@@ -513,14 +550,24 @@ def screening(
                     shadow_ratio_val = upper_shadow / real_body
 
                     if vol_ratio_val >= volume_ratio and shadow_ratio_val >= shadow_ratio:
+                        # 前日比（出来高）：(当日出来高 - 前日出来高) / 前日出来高 * 100
+                        # vol_ratio_val（当日出来高 / 前日出来高）から導出できるが、
+                        # 列見出し「出来高（前日出来高 / 前日比%）」の意味に合わせて
+                        # 明示的に前日比（％）として算出する
+                        vol_change_pct = (today_vol - prev_vol) / prev_vol * 100
+
                         results.append({
                             "コード": code,
                             "銘柄名": name,
-                            "出来高倍率": round(vol_ratio_val, 2),
-                            "上髭実体比": round(shadow_ratio_val, 2),
+                            "時価総額": calc_market_cap(code, close),
+                            "終値": close,
                             "出来高": int(today_vol),
+                            "前日出来高": int(prev_vol),
+                            "出来高前日比": round(vol_change_pct, 2),
+                            "売買代金": round(today_vol * close, 0),
                             "上髭": round(upper_shadow, 2),
                             "実体": round(real_body, 2),
+                            "上髭実体比": round(shadow_ratio_val, 4),
                         })
 
                 except Exception:
@@ -580,6 +627,7 @@ def screening(
                     results.append({
                         "コード": code,
                         "銘柄名": name,
+                        "時価総額": calc_market_cap(code, today_close),
                         "値上がり率": round(change_rate, 2),
                         "当日終値": today_close,
                         "前日終値": prev_close,
@@ -638,9 +686,15 @@ def screening(
                 name = ticker_row["銘柄名"]
                 score = calc_heuristics_score(tech)
 
+                # 時価総額の算出には data.json（ratio/date_ranking モードと共通の日次OHLCV）の
+                # target_date 時点の終値を用いる（heuristics JSON 自体は終値を含まないため）
+                day_entry = data_json.get(code_str)
+                price_for_cap = day_entry.get(target_date, {}).get("c") if isinstance(day_entry, dict) else None
+
                 array_data.append({
                     "コード":       code_str,
                     "銘柄名":       name,
+                    "時価総額":     calc_market_cap(code_str, price_for_cap),
                     "アップスコア": score["up"],
                     "ダウンスコア": score["down"],
                     "applied_up_rules":   score.get("applied_up_rules", []),
@@ -773,9 +827,14 @@ def screening(
                     results.append({
                         "コード": code,
                         "銘柄名": name,
+                        "時価総額": None,
                         "error": "終値データを取得できませんでした",
                     })
                     continue
+
+                # 時価総額は比較元日付時点の株価（比較元終値）を基準に算出する。
+                # コードごとに一定の値のため、対象日ループの外で1回だけ計算する。
+                market_cap = calc_market_cap(code, from_close)
 
                 if source_mode == "ratio":
                     prediction = "up"
@@ -798,6 +857,7 @@ def screening(
                             results.append({
                                 "コード": code,
                                 "銘柄名": name,
+                                "時価総額": market_cap,
                                 "比較先日付": target_date,
                                 "比較元終値": from_close,
                                 "予測": prediction,
@@ -811,6 +871,7 @@ def screening(
                         results.append({
                             "コード": code,
                             "銘柄名": name,
+                            "時価総額": market_cap,
                             "比較先日付": target_date,
                             "比較元終値": from_close,
                             "比較先終値": to_close,
@@ -832,6 +893,7 @@ def screening(
                     results.append({
                         "コード": code,
                         "銘柄名": name,
+                        "時価総額": market_cap,
                         "比較元終値": from_close,
                         "予測": prediction,
                         "error": "終値データを取得できませんでした",
@@ -844,6 +906,7 @@ def screening(
                 results.append({
                     "コード": code,
                     "銘柄名": name,
+                    "時価総額": market_cap,
                     "比較元終値": from_close,
                     "比較先終値": to_close,
                     "増減円": diff_yen,
@@ -910,6 +973,7 @@ def screening(
                     "コード": code,
                     "銘柄名": name,
                     "日次売買代金": volume * close,
+                    "終値": close,
                 })
 
             candidates.sort(key=lambda x: x["日次売買代金"], reverse=True)
@@ -944,6 +1008,7 @@ def screening(
                     results.append({
                         "コード": cand["コード"],
                         "銘柄名": cand["銘柄名"],
+                        "時価総額": calc_market_cap(cand["コード"], cand["終値"]),
                         "日次売買代金": round(cand["日次売買代金"], 0),
                         **detection,
                     })
