@@ -7,6 +7,8 @@ from io import BytesIO
 import warnings
 import re
 import os
+import time
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from app.heuristics_scoring import calc_heuristics_score
 
@@ -43,9 +45,9 @@ def github_headers():
 # ============================
 BASE_URL = "https://raw.githubusercontent.com/yt-F6D34A22-537C-E881-530F-F9E7A956A78B/batches/refs/heads/main/data/"
 
-DATA_JSON_URL = BASE_URL + "data.json"
 EXCEL_URL = BASE_URL + "data_j.xlsx"
 RAW_HEURISTICS_PREFIX = BASE_URL + "heuristics/"
+RAW_OHLCV_PREFIX = BASE_URL + "ohlcv/"  # ohlcv_YYYYMMDD.json 形式（2026-07、data.json を置き換え）
 MARKET_CAP_JSON_URL = BASE_URL + "market_cap.json"  # {コード: 発行済株式数} 形式（2026-07 追加）
 
 # ============================
@@ -68,9 +70,24 @@ GIT_TREE_API = f"https://api.github.com/repos/{repo_user}/{repo_name}/git/trees/
 # データ読み込み
 # ============================
 ticker_list = []
-data_json = {}
 market_cap_json = {}    # {コード: 発行済株式数}。2026-07 追加（時価総額列のため）
 trading_dates_cache = []  # /trading_dates 用（3か月分の市場開場日。起動時に1回だけ取得）
+
+# ------------------------------------------------------------------
+# OHLCV（旧 data.json）: 固定N日ウィンドウを常駐させる方式を廃止し、
+# リクエストされた日付分だけをオンデマンドで取得・キャッシュする
+# （2026-07、OHLCV_WINDOW_DAYS 廃止に伴う変更。フロントエンド側の日付選択肢は
+#   アーカイブの全期間から広く選べるようにする一方、バックエンドは実際に
+#   扱うファイルだけに通信量を絞ることを目的とする）。
+# ------------------------------------------------------------------
+_ohlcv_dates_cache: list[str] = []        # 降順（新しい日付が先頭）。data/ohlcv/**/ohlcv_YYYYMMDD.json の一覧
+_ohlcv_dates_cache_at: float = 0.0
+OHLCV_DATES_CACHE_TTL_SEC = 300  # 5分。GitHub trees API のレート制限に配慮しつつ、
+                                  # 当日分アーカイブの出現をほどよい遅延で反映する
+
+_ohlcv_content_cache: dict[str, tuple[dict, float]] = {}  # date -> (data, fetched_at)
+OHLCV_TODAY_CACHE_TTL_SEC = 300  # 5分。当日分は fetch.js により1日に複数回上書きされ得るため、
+                                  # 恒久的に不変な過去日分とは別に短いTTLを設ける
 
 def load_ticker_list():
     global ticker_list
@@ -83,22 +100,105 @@ def load_ticker_list():
         print("Failed to load ticker list:", e)
         ticker_list = []
 
-def load_data_json():
-    global data_json
+def list_ohlcv_dates() -> list[str]:
+    """
+    GitHub trees API から data/ohlcv/**/ohlcv_YYYYMMDD.json を抽出し、
+    降順（新しい日付が先頭）で返す。/heuristics_dates と同一パターン。
+    """
     try:
-        resp = requests.get(DATA_JSON_URL)
+        resp = requests.get(GIT_TREE_API, headers=github_headers())
         resp.raise_for_status()
-        data_json = json.loads(resp.text)
+        tree = resp.json().get("tree", [])
+        dates = [
+            m.group(1)
+            for item in tree
+            if (m := re.match(r"data/ohlcv/\d{6}/ohlcv_(\d{8})\.json$", item.get("path", "")))
+        ]
+        return sorted(dates, reverse=True)
     except Exception as e:
-        print("Failed to load data.json:", e)
-        data_json = {}
+        print("Failed to list ohlcv dates:", e)
+        return []
+
+def get_ohlcv_dates() -> list[str]:
+    """
+    ohlcv アーカイブの日付一覧をTTLキャッシュ付きで返す（全期間・フル履歴）。
+    /dates（プルダウン用。フロントエンドに広い選択肢を提供する）と、
+    ratio/date_ranking モードの「対象日・直前営業日」解決の両方から使う。
+    """
+    global _ohlcv_dates_cache, _ohlcv_dates_cache_at
+    if not _ohlcv_dates_cache or (time.time() - _ohlcv_dates_cache_at) > OHLCV_DATES_CACHE_TTL_SEC:
+        dates = list_ohlcv_dates()
+        if dates:
+            _ohlcv_dates_cache = dates
+            _ohlcv_dates_cache_at = time.time()
+    return _ohlcv_dates_cache
+
+def load_ohlcv_dates():
+    """起動時に1回、日付一覧のキャッシュを温めておく（load_ticker_list() 等と同じ位置付け）。"""
+    get_ohlcv_dates()
+
+def fetch_ohlcv_file(date: str) -> dict:
+    """1日分の ohlcv_YYYYMMDD.json（{コード: {o,h,l,c,v}}}）を取得する。"""
+    try:
+        resp = requests.get(f"{RAW_OHLCV_PREFIX}{date[:6]}/ohlcv_{date}.json")
+        resp.raise_for_status()
+        return json.loads(resp.text)
+    except Exception as e:
+        print(f"Failed to load ohlcv_{date}.json:", e)
+        return {}
+
+def get_ohlcv_for_date(date: str) -> dict:
+    """
+    指定日の ohlcv_YYYYMMDD.json をプロセス内キャッシュ付きで取得する。
+    過去日分は恒久的に不変（fetch.js は当日以外を上書きしない）ため無期限にキャッシュしてよいが、
+    当日（JST）分だけは1日に複数回上書きされ得るため OHLCV_TODAY_CACHE_TTL_SEC で再取得する。
+    """
+    today_jst = (datetime.utcnow() + timedelta(hours=9)).strftime("%Y%m%d")
+    cached = _ohlcv_content_cache.get(date)
+    if cached:
+        data, fetched_at = cached
+        if date != today_jst or (time.time() - fetched_at) < OHLCV_TODAY_CACHE_TTL_SEC:
+            return data
+    data = fetch_ohlcv_file(date)
+    _ohlcv_content_cache[date] = (data, time.time())
+    return data
+
+def resolve_ratio_dates(target_date: str | None) -> tuple[str | None, str | None]:
+    """
+    ratio モード専用：target_date が有効なアーカイブ日ならその日と直前の営業日を、
+    無効／未指定ならアーカイブ内の最新2営業日を返す
+    （旧 data.json 版の「target_date が見つからない場合は最新2日にフォールバックする」
+    挙動をそのまま踏襲する）。
+    """
+    dates = get_ohlcv_dates()
+    if target_date and target_date in dates:
+        idx = dates.index(target_date)
+        if idx + 1 >= len(dates):
+            return None, None
+        return dates[idx], dates[idx + 1]
+    if len(dates) < 2:
+        return None, None
+    return dates[0], dates[1]
+
+def resolve_date_ranking_dates(target_date: str) -> tuple[str | None, str | None]:
+    """
+    date_ranking モード専用：target_date が有効なアーカイブ日ならその日と直前の営業日を返す。
+    旧 data.json 版と同様、フォールバックは行わない（見つからなければ (None, None)）。
+    """
+    dates = get_ohlcv_dates()
+    if target_date not in dates:
+        return None, None
+    idx = dates.index(target_date)
+    if idx + 1 >= len(dates):
+        return None, None
+    return target_date, dates[idx + 1]
 
 def load_market_cap():
     """
     銘柄ごとの発行済株式数（{コード: 株数}）を market_cap.json から読み込む。
     発行済株式数は株式分割・自己株買い等がなければ短期間では変化しないため、
-    data.json（日次更新）とは別に、低頻度（週次を想定）で更新される
-    市場データを想定している。生成は scripts/fetch_market_cap.py・
+    ohlcv アーカイブ（日次更新。2026-07、data.json から変更）とは別に、
+    低頻度（週次を想定）で更新される市場データを想定している。生成は scripts/fetch_market_cap.py・
     .github/workflows/market_cap.yml を参照。
     時価総額そのもの（円建ての金額）ではなく株数を保持するのは、
     日々変動する終値と組み合わせて時価総額を都度計算するため
@@ -133,7 +233,7 @@ def load_trading_dates():
     yfinance によるYahoo Financeへの外部通信は数秒〜十数秒かかることがあり、
     これをリクエスト処理のたびに行うと、Renderのコールドスタート（dyno起動）に
     かかる時間と合算してタイムアウトしてしまう不具合があった（2026-07 修正）。
-    load_ticker_list() / load_data_json() と同様に、起動時（モジュール読み込み時）に
+    load_ticker_list() / load_ohlcv_dates() と同様に、起動時（モジュール読み込み時）に
     1回だけ実行してキャッシュし、/trading_dates はキャッシュを返すだけにする。
     """
     global trading_dates_cache
@@ -154,7 +254,7 @@ def load_trading_dates():
         trading_dates_cache = []
 
 load_ticker_list()
-load_data_json()
+load_ohlcv_dates()
 load_market_cap()
 load_trading_dates()
 
@@ -175,8 +275,9 @@ COMPARE_FETCH_MAX_WORKERS = 8
 def fetch_close_price(code: str, date: str) -> float | None:
     """
     指定銘柄コードの指定日（YYYYMMDD）の終値を取得する。
-    data.json の保持範囲（直近10日）を超える日付にも対応するため
-    yfinance から個別取得する。
+    compare モードは ohlcv アーカイブ（ratio/date_ranking/heuristics/block が参照する
+    日次OHLCV）を経由せず、常に yfinance から個別取得する設計を維持している
+    （2026-07、data.json の恒久アーカイブ化後も本方針は変更していない）。
     """
     try:
         symbol = f"{code}.T"
@@ -377,13 +478,10 @@ def _fetch_block_detection(code: str, target_date: str, threshold_yen: float):
 @app.get("/dates")
 def get_dates():
     try:
-        all_dates = set()
-        for symbol, entry in data_json.items():
-            if isinstance(entry, dict):
-                for d in entry.keys():
-                    if d.isdigit():
-                        all_dates.add(d)
-        return {"status": "ok", "dates": sorted(all_dates, reverse=True)}
+        dates = get_ohlcv_dates()
+        if not dates:
+            return {"error": "no ohlcv date data"}
+        return {"status": "ok", "dates": dates}
     except Exception as e:
         return {"error": "failed to load dates", "detail": str(e)}
 
@@ -394,13 +492,14 @@ def get_dates():
 def get_trading_dates():
     """
     直近3か月の市場開場日一覧を返す。
-    data.json は直近10日分のみ保持のため、より長期間の開場日カレンダーが
-    必要な compare モードの比較元日付セレクタ用に、
+    ohlcv アーカイブ（旧 data.json）は日付ごとに恒久保存されているが、
+    compare モードの比較元日付セレクタには「市場が開いていた日」という
+    暦カレンダー情報そのものが必要なため、
     起動時（モジュール読み込み時）に load_trading_dates() で1回だけ取得した
     trading_dates_cache を返す（2026-07 修正。以前はリクエスト毎に
     yfinance へ問い合わせていたが、Renderのコールドスタート時に
     起動遅延と外部通信時間が合算してタイムアウトする不具合があったため、
-    /dates（data_json）と同じ「起動時に1回だけ取得してキャッシュする」
+    /dates（get_ohlcv_dates()）と同じ「起動時に1回だけ取得してキャッシュする」
     方式に統一した）。
     ただし、起動時の取得自体が外部通信の失敗で空振りした場合、リトライが
     一切行われず、プロセスが再起動されるまで永久に失敗し続ける不具合が
@@ -488,6 +587,13 @@ def screening(
         try:
             exclude_set = parse_exclude_markets(exclude_markets)
 
+            today_key, prev_key = resolve_ratio_dates(target_date)
+            if not today_key or not prev_key:
+                return {"status": "ok", "data": []}
+
+            today_data = get_ohlcv_for_date(today_key)
+            prev_data = get_ohlcv_for_date(prev_key)
+
             for row in ticker_list:
                 code = str(row["コード"])
                 name = row["銘柄名"]
@@ -498,29 +604,8 @@ def screening(
                 if exclude_set and market in exclude_set:
                     continue
 
-                if symbol not in data_json:
-                    continue
-
-                entry = data_json[symbol]
-                if not isinstance(entry, dict):
-                    continue
-
-                dates = sorted([d for d in entry.keys() if d.isdigit()])
-
-                if target_date and target_date in dates:
-                    idx = dates.index(target_date)
-                    if idx == 0:
-                        continue
-                    today_key = dates[idx]
-                    prev_key = dates[idx - 1]
-                else:
-                    if len(dates) < 2:
-                        continue
-                    today_key = dates[-1]
-                    prev_key = dates[-2]
-
-                today = entry.get(today_key)
-                prev = entry.get(prev_key)
+                today = today_data.get(symbol)
+                prev = prev_data.get(symbol)
 
                 if not today or not prev:
                     continue
@@ -587,30 +672,20 @@ def screening(
             return {"error": "target_date is required"}
 
         try:
+            today_key, prev_key = resolve_date_ranking_dates(target_date)
+            if not today_key or not prev_key:
+                return {"status": "ok", "data": []}
+
+            today_data = get_ohlcv_for_date(today_key)
+            prev_data = get_ohlcv_for_date(prev_key)
+
             for row in ticker_list:
                 code = str(row["コード"])
                 name = row["銘柄名"]
                 symbol = code
 
-                if symbol not in data_json:
-                    continue
-
-                entry = data_json[symbol]
-                if not isinstance(entry, dict):
-                    continue
-
-                dates = sorted([d for d in entry.keys() if d.isdigit()])
-                if target_date not in dates:
-                    continue
-
-                idx = dates.index(target_date)
-                if idx == 0:
-                    continue
-
-                prev_key = dates[idx - 1]
-
-                today = entry[target_date]
-                prev = entry[prev_key]
+                today = today_data.get(symbol)
+                prev = prev_data.get(symbol)
 
                 if not today or not prev:
                     continue
@@ -686,10 +761,11 @@ def screening(
                 name = ticker_row["銘柄名"]
                 score = calc_heuristics_score(tech)
 
-                # 時価総額の算出には data.json（ratio/date_ranking モードと共通の日次OHLCV）の
-                # target_date 時点の終値を用いる（heuristics JSON 自体は終値を含まないため）
-                day_entry = data_json.get(code_str)
-                price_for_cap = day_entry.get(target_date, {}).get("c") if isinstance(day_entry, dict) else None
+                # 時価総額の算出には ohlcv_YYYYMMDD.json（ratio/date_ranking モードと共通の
+                # 日次OHLCV。2026-07、data.json から変更）の target_date 時点の終値を用いる
+                # （heuristics JSON 自体は終値を含まないため）
+                day_data = get_ohlcv_for_date(target_date)
+                price_for_cap = day_data.get(code_str, {}).get("c")
 
                 array_data.append({
                     "コード":       code_str,
@@ -942,12 +1018,15 @@ def screening(
 
             # ------------------------------
             # 一次スクリーニング：日次売買代金（出来高×終値）による候補絞り込み
-            # data.json のみを用いた in-memory 処理のため外部通信は発生しない。
+            # get_ohlcv_for_date(target_date) は ohlcv_YYYYMMDD.json 1ファイル分のみを
+            # 取得する（未キャッシュの場合はGitHub Rawへの1回のHTTP取得が発生するが、
+            # 全銘柄ぶんの1分足取得に比べれば軽量。2026-07、data.json 常駐方式から変更）。
             # 全銘柄（約4000銘柄）に対して毎回1分足を取得するのは非現実的
             # （Yahoo Finance のレート制限・応答時間の両面で）なため、
             # まずこの安価な処理で候補を上位 limit 件に絞り込む。
             # ------------------------------
             candidates = []
+            day_data = get_ohlcv_for_date(target_date)
             for row in ticker_list:
                 code = str(row["コード"])
                 name = row["銘柄名"]
@@ -956,11 +1035,7 @@ def screening(
                 if exclude_set and market in exclude_set:
                     continue
 
-                entry = data_json.get(code)
-                if not isinstance(entry, dict):
-                    continue
-
-                day = entry.get(target_date)
+                day = day_data.get(code)
                 if not day:
                     continue
 
