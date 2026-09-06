@@ -46,11 +46,30 @@ def github_headers():
 # 復習ページ機能：しおり・メモの保存（2026-09 追加）
 # ============================
 # 保存先はフロントエンド（webapp-frontend）リポジトリの data/review_notes.json。
-# 既存の GITHUB_TOKEN を流用するが、Raw取得・trees API（読み取り専用）とは異なり
-# Contents API での書き込み（コミット）を行うため、このトークンには
-# 書き込み権限（classic PAT なら repo スコープ、Fine-grained PAT なら
-# 対象リポジトリへの Contents: Read and write）が別途必要。
-# 権限が不足している場合、_put_review_notes_file() が 403 で例外を送出する。
+#
+# 権限分離の方針（2026-09 更新）：
+# 既存の GITHUB_TOKEN は batches リポジトリの読み取り専用（Raw取得・trees API）
+# として使い続け、変更しない。復習ページ機能の書き込み（Contents APIでの
+# コミット）には、webapp-frontend リポジトリへの Contents: Read and write
+# 権限のみを持つ別トークンを新たに発行し、REVIEW_GITHUB_TOKEN として設定する。
+# こうすることで、既存の読み取り専用トークンに書き込み権限を付与する必要が
+# なくなり、万一 REVIEW_GITHUB_TOKEN が漏洩しても被害範囲を
+# webapp-frontend リポジトリのみに限定できる（最小権限の原則）。
+REVIEW_GITHUB_TOKEN = os.getenv("REVIEW_GITHUB_TOKEN")
+
+
+def review_github_headers():
+    """
+    復習ページ機能（review_notes.json / review_chapters.json）専用の
+    GitHub API 用ヘッダ。既存の github_headers()（GITHUB_TOKEN・batches用）
+    とは意図的に分離している。
+    """
+    headers = {}
+    if REVIEW_GITHUB_TOKEN:
+        headers["Authorization"] = f"token {REVIEW_GITHUB_TOKEN}"
+    return headers
+
+
 REVIEW_API_SECRET = os.getenv("REVIEW_API_SECRET")
 
 # NOTE: batches リポジトリ（BASE_URL）とは別のリポジトリ。
@@ -96,15 +115,17 @@ def _require_review_secret(x_review_secret: str | None):
         raise HTTPException(status_code=401, detail="invalid or missing X-Review-Secret header")
 
 
-def _get_github_json_for_write(contents_api: str, branch: str, default: dict):
+def _get_github_json_for_write(contents_api: str, branch: str, default: dict, headers: dict):
     """
     GitHub Contents API から、書き込み対象JSONの最新内容と sha を取得する汎用ヘルパー。
     - Raw URL（CDNキャッシュあり）ではなく Contents API を使うのは、更新の競合を
       避けるため sha が常に最新である必要があるため。
     - ファイルが存在しない場合（初回書き込み前）は 404 になるため、その場合は
       default のコピーと sha=None を返す（新規作成として扱う）。
+    - headers は呼び出し元がどのトークン（github_headers() /
+      review_github_headers() など）を使うかを決めて渡す。
     """
-    resp = requests.get(contents_api, headers=github_headers(), params={"ref": branch})
+    resp = requests.get(contents_api, headers=headers, params={"ref": branch})
     if resp.status_code == 404:
         return json.loads(json.dumps(default)), None  # default を書き換えないよう deep copy
     resp.raise_for_status()
@@ -113,10 +134,11 @@ def _get_github_json_for_write(contents_api: str, branch: str, default: dict):
     return content, payload["sha"]
 
 
-def _put_github_json_file(contents_api: str, branch: str, content: dict, sha: str | None, message: str):
+def _put_github_json_file(contents_api: str, branch: str, content: dict, sha: str | None, message: str, headers: dict):
     """
     JSONコンテンツを GitHub Contents API 経由でコミットする汎用ヘルパー。
     sha が None（ファイル新規作成）の場合は sha を省略して送信する。
+    headers は呼び出し元が指定したトークンのヘッダをそのまま使う。
     """
     body = {
         "message": message,
@@ -127,19 +149,23 @@ def _put_github_json_file(contents_api: str, branch: str, content: dict, sha: st
     }
     if sha:
         body["sha"] = sha
-    resp = requests.put(contents_api, headers=github_headers(), json=body)
+    resp = requests.put(contents_api, headers=headers, json=body)
     resp.raise_for_status()
     return resp.json()
 
 
 def _get_review_notes_for_write():
     return _get_github_json_for_write(
-        REVIEW_NOTES_CONTENTS_API, REVIEW_NOTES_REPO_BRANCH, REVIEW_NOTES_DEFAULT
+        REVIEW_NOTES_CONTENTS_API, REVIEW_NOTES_REPO_BRANCH, REVIEW_NOTES_DEFAULT,
+        headers=review_github_headers(),
     )
 
 
 def _put_review_notes_file(content: dict, sha: str | None, message: str):
-    return _put_github_json_file(REVIEW_NOTES_CONTENTS_API, REVIEW_NOTES_REPO_BRANCH, content, sha, message)
+    return _put_github_json_file(
+        REVIEW_NOTES_CONTENTS_API, REVIEW_NOTES_REPO_BRANCH, content, sha, message,
+        headers=review_github_headers(),
+    )
 
 
 class BookmarkRequest(BaseModel):
@@ -233,12 +259,16 @@ REVIEW_CHAPTERS_DEFAULT = {
 
 def _get_review_chapters_for_write():
     return _get_github_json_for_write(
-        REVIEW_CHAPTERS_CONTENTS_API, REVIEW_NOTES_REPO_BRANCH, REVIEW_CHAPTERS_DEFAULT
+        REVIEW_CHAPTERS_CONTENTS_API, REVIEW_NOTES_REPO_BRANCH, REVIEW_CHAPTERS_DEFAULT,
+        headers=review_github_headers(),
     )
 
 
 def _put_review_chapters_file(content: dict, sha: str | None, message: str):
-    return _put_github_json_file(REVIEW_CHAPTERS_CONTENTS_API, REVIEW_NOTES_REPO_BRANCH, content, sha, message)
+    return _put_github_json_file(
+        REVIEW_CHAPTERS_CONTENTS_API, REVIEW_NOTES_REPO_BRANCH, content, sha, message,
+        headers=review_github_headers(),
+    )
 
 
 def _cleanup_orphaned_review_data(chapter_id: str):
