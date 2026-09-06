@@ -1,8 +1,10 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 import pandas as pd
 import requests
 import json
+import base64
 from io import BytesIO
 import warnings
 import re
@@ -39,6 +41,262 @@ def github_headers():
     if GITHUB_TOKEN:
         headers["Authorization"] = f"token {GITHUB_TOKEN}"
     return headers
+
+# ============================
+# 復習ページ機能：しおり・メモの保存（2026-09 追加）
+# ============================
+# 保存先はフロントエンド（webapp-frontend）リポジトリの data/review_notes.json。
+# 既存の GITHUB_TOKEN を流用するが、Raw取得・trees API（読み取り専用）とは異なり
+# Contents API での書き込み（コミット）を行うため、このトークンには
+# 書き込み権限（classic PAT なら repo スコープ、Fine-grained PAT なら
+# 対象リポジトリへの Contents: Read and write）が別途必要。
+# 権限が不足している場合、_put_review_notes_file() が 403 で例外を送出する。
+REVIEW_API_SECRET = os.getenv("REVIEW_API_SECRET")
+
+# NOTE: batches リポジトリ（BASE_URL）とは別のリポジトリ。
+# オーナー名・ブランチ名は既知の GitHub Pages 配信URL
+# （https://yt-f6d34a22-537c-e881-530f-f9e7a956a78b.github.io/webapp-frontend/）
+# から推測したものであり、実際のデフォルトブランチ名が main と異なる場合は
+# REVIEW_NOTES_REPO_BRANCH を実態に合わせて修正すること（推測箇所）。
+REVIEW_NOTES_REPO_OWNER = "yt-f6d34a22-537c-e881-530f-f9e7a956a78b"
+REVIEW_NOTES_REPO_NAME = "webapp-frontend"
+REVIEW_NOTES_REPO_BRANCH = "main"
+REVIEW_NOTES_PATH = "data/review_notes.json"
+
+REVIEW_NOTES_CONTENTS_API = (
+    f"https://api.github.com/repos/{REVIEW_NOTES_REPO_OWNER}/{REVIEW_NOTES_REPO_NAME}"
+    f"/contents/{REVIEW_NOTES_PATH}"
+)
+REVIEW_NOTES_RAW_URL = (
+    f"https://raw.githubusercontent.com/{REVIEW_NOTES_REPO_OWNER}/{REVIEW_NOTES_REPO_NAME}"
+    f"/refs/heads/{REVIEW_NOTES_REPO_BRANCH}/{REVIEW_NOTES_PATH}"
+)
+
+REVIEW_NOTES_DEFAULT = {"bookmarks": [], "memos": {}}
+
+
+def _require_review_secret(x_review_secret: str | None):
+    """
+    書き込み系エンドポイント（しおり登録・メモ保存）共通の簡易認可チェック。
+
+    NOTE: フロントエンドはビルド工程を持たない静的サイト（GitHub Pages）のため、
+    review.js に合言葉を直接書いてコミットすると、誰でもページのソースを見れば
+    値が分かってしまう（＝実質無認可と同じになる）。そのため、この合言葉は
+    ソースにハードコードせず、review.js 側で初回操作時に prompt() で入力させ
+    ブラウザの localStorage にのみ保持する方式を前提とする（詳細は
+    review.js の getReviewSecret() を参照）。あくまで「URLを知っているだけの
+    第三者による誤操作・いたずら書き込み」を防ぐための最低限の措置であり、
+    本格的な認証（ログイン等）の代替ではない点に留意すること。
+    """
+    if not REVIEW_API_SECRET:
+        # サーバー側で未設定のまま公開されると無防備な書き込みエンドポイントに
+        # なってしまうため、未設定時は機能ごと拒否する（安全側に倒す）
+        raise HTTPException(status_code=503, detail="review write endpoint is not configured")
+    if not x_review_secret or x_review_secret != REVIEW_API_SECRET:
+        raise HTTPException(status_code=401, detail="invalid or missing X-Review-Secret header")
+
+
+def _get_github_json_for_write(contents_api: str, branch: str, default: dict):
+    """
+    GitHub Contents API から、書き込み対象JSONの最新内容と sha を取得する汎用ヘルパー。
+    - Raw URL（CDNキャッシュあり）ではなく Contents API を使うのは、更新の競合を
+      避けるため sha が常に最新である必要があるため。
+    - ファイルが存在しない場合（初回書き込み前）は 404 になるため、その場合は
+      default のコピーと sha=None を返す（新規作成として扱う）。
+    """
+    resp = requests.get(contents_api, headers=github_headers(), params={"ref": branch})
+    if resp.status_code == 404:
+        return json.loads(json.dumps(default)), None  # default を書き換えないよう deep copy
+    resp.raise_for_status()
+    payload = resp.json()
+    content = json.loads(base64.b64decode(payload["content"]).decode("utf-8"))
+    return content, payload["sha"]
+
+
+def _put_github_json_file(contents_api: str, branch: str, content: dict, sha: str | None, message: str):
+    """
+    JSONコンテンツを GitHub Contents API 経由でコミットする汎用ヘルパー。
+    sha が None（ファイル新規作成）の場合は sha を省略して送信する。
+    """
+    body = {
+        "message": message,
+        "content": base64.b64encode(
+            json.dumps(content, ensure_ascii=False, indent=2).encode("utf-8")
+        ).decode("utf-8"),
+        "branch": branch,
+    }
+    if sha:
+        body["sha"] = sha
+    resp = requests.put(contents_api, headers=github_headers(), json=body)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _get_review_notes_for_write():
+    return _get_github_json_for_write(
+        REVIEW_NOTES_CONTENTS_API, REVIEW_NOTES_REPO_BRANCH, REVIEW_NOTES_DEFAULT
+    )
+
+
+def _put_review_notes_file(content: dict, sha: str | None, message: str):
+    return _put_github_json_file(REVIEW_NOTES_CONTENTS_API, REVIEW_NOTES_REPO_BRANCH, content, sha, message)
+
+
+class BookmarkRequest(BaseModel):
+    chapter_id: str
+    bookmarked: bool
+
+
+# ============================
+# 復習ページ機能：章コンテンツの管理（2026-09 追加）
+# ============================
+# review.js に直書きしていた章本文を data/review_chapters.json（webapp-frontend
+# リポジトリ）に切り出し、review_notes.json と同じ Contents API の仕組みで
+# 読み書きできるようにする。これにより、章の追加・編集をコードの修正なしに
+# 行えるようになる（POST /review/chapter を叩くか、GitHub上で直接JSONを編集する）。
+REVIEW_CHAPTERS_PATH = "data/review_chapters.json"
+
+REVIEW_CHAPTERS_CONTENTS_API = (
+    f"https://api.github.com/repos/{REVIEW_NOTES_REPO_OWNER}/{REVIEW_NOTES_REPO_NAME}"
+    f"/contents/{REVIEW_CHAPTERS_PATH}"
+)
+REVIEW_CHAPTERS_RAW_URL = (
+    f"https://raw.githubusercontent.com/{REVIEW_NOTES_REPO_OWNER}/{REVIEW_NOTES_REPO_NAME}"
+    f"/refs/heads/{REVIEW_NOTES_REPO_BRANCH}/{REVIEW_CHAPTERS_PATH}"
+)
+
+# data/review_chapters.json がまだ存在しない場合（初回稼働時）の初期コンテンツ。
+# 従来 review.js に直書きしていた4章分をそのまま初期値として引き継いでいる。
+REVIEW_CHAPTERS_DEFAULT = {
+    "chapters": [
+        {
+            "id": "candlestick-basics",
+            "part": "第1部　値動きを読む基礎",
+            "title": "ローソク足とは何を表すか",
+            "readMinutes": 3,
+            "bodyHtml": (
+                "<p class=\"lead\">ローソク足は、ある期間（日足なら1日）の始値・高値・安値・終値の"
+                "4つの値を1本にまとめて表したものです。実体の色で「上がって終わったか、下がって終わったか」"
+                "が一目で分かり、上下に伸びるヒゲで期間中にどこまで値が動いたかが分かります。</p>"
+                "<p>実体が長いほど、その期間の始値と終値の差が大きい＝方向感のある値動きだったことを示します。"
+                "逆に実体が小さいほど、始値付近で終わった＝迷いのある値動きだったと解釈できます。</p>"
+                "<p>次の章では、実体に対してヒゲが極端に長い形（上ヒゲ・下ヒゲ）が何を示すのかを見ていきます。</p>"
+            ),
+        },
+        {
+            "id": "shadow-meaning",
+            "part": "第1部　値動きを読む基礎",
+            "title": "上ヒゲ・下ヒゲの意味",
+            "readMinutes": 4,
+            "bodyHtml": (
+                "<p class=\"lead\">上ヒゲが長いローソク足は、一度は買われたものの、その水準を維持できなかった"
+                "足跡です。高値圏で出現すると、上昇の勢いが尽きかけているサインとして扱われることが多くあります。</p>"
+                "<p>重要なのは、<mark>ヒゲの長さそのものではなく、実体との比率</mark>です。実体が小さく上ヒゲだけが"
+                "極端に長い形は、買い方が高値で売り方に押し返された結果であり、需給が転換しつつある可能性を示します。</p>"
+                "<div class=\"callout\">この考え方は、スクリーニング条件の<strong>「出来高×上髭」</strong>および"
+                "<strong>「上髭実体比以上」</strong>のしきい値設定に対応しています。"
+                "<a href=\"index.html\">この条件でスクリーニングする →</a></div>"
+                "<p>ただし、上ヒゲ単体で判断するのは危険です。出来高を伴わない上ヒゲは、単なる薄商いの振れであることも"
+                "多く、次の章で扱う出来高とあわせて確認する必要があります。</p>"
+            ),
+        },
+        {
+            "id": "volume-meaning",
+            "part": "第1部　値動きを読む基礎",
+            "title": "出来高が語ること",
+            "readMinutes": 4,
+            "bodyHtml": (
+                "<p class=\"lead\">出来高は「その日、どれだけの株数が売買されたか」を示します。値動きの大きさだけ"
+                "でなく、その値動きにどれだけの参加者が関わっていたかを知る手がかりになります。</p>"
+                "<p>前日と比べて出来高が急増している場合、何らかのニュースや材料をきっかけに新規の参加者が増えたと"
+                "考えられます。上ヒゲ・下ヒゲと組み合わせることで、値動きの「勢い」と「信頼度」の両方を見ることが"
+                "できます。</p>"
+                "<div class=\"callout\">この考え方は、スクリーニング条件の<strong>「出来高倍率以上」</strong>の"
+                "しきい値設定に対応しています。<a href=\"index.html\">この条件でスクリーニングする →</a></div>"
+            ),
+        },
+        {
+            "id": "heuristics-design",
+            "part": "第2部　スクリーニングの考え方",
+            "title": "経験則判定の設計思想",
+            "readMinutes": 5,
+            "bodyHtml": (
+                "<p class=\"lead\">経験則判定（heuristics）は、複数のテクニカル指標を組み合わせて「上昇・下降"
+                "どちらの可能性が高いか」をスコアとして算出する仕組みです。</p>"
+                "<p>単一の指標だけで判断すると、ダマシ（一時的な逆行）に振り回されやすくなります。複数の指標が"
+                "同じ方向を示しているときほど、その方向感の信頼度が高いと考えるのが基本的な設計思想です。</p>"
+            ),
+        },
+    ]
+}
+
+
+def _get_review_chapters_for_write():
+    return _get_github_json_for_write(
+        REVIEW_CHAPTERS_CONTENTS_API, REVIEW_NOTES_REPO_BRANCH, REVIEW_CHAPTERS_DEFAULT
+    )
+
+
+def _put_review_chapters_file(content: dict, sha: str | None, message: str):
+    return _put_github_json_file(REVIEW_CHAPTERS_CONTENTS_API, REVIEW_NOTES_REPO_BRANCH, content, sha, message)
+
+
+def _cleanup_orphaned_review_data(chapter_id: str):
+    """
+    章削除時に、対応する review_notes.json 側の孤立データ（しおり・メモ）を
+    あわせて削除する。
+
+    章コンテンツ（review_chapters.json）としおり・メモ（review_notes.json）は
+    別ファイルのため、章の削除コミットとは別にもう一度コミットが発生する
+    （1回のAPI呼び出しで2回コミットされる点に留意）。
+
+    このクリーンアップ自体が失敗しても章の削除そのものは取り消さない
+    （呼び出し元 delete_review_chapter() は、このクリーンアップの成否に
+    関わらず章の削除は成功として扱い、クリーンアップ結果は付随情報として
+    レスポンスに含めるのみとする）。
+    """
+    try:
+        content, sha = _get_review_notes_for_write()
+        bookmarks = content.get("bookmarks", [])
+        memos = content.get("memos", {})
+
+        bookmark_removed = chapter_id in bookmarks
+        memo_removed = chapter_id in memos
+
+        if not bookmark_removed and not memo_removed:
+            return {"bookmark_removed": False, "memo_removed": False}
+
+        if bookmark_removed:
+            content["bookmarks"] = [b for b in bookmarks if b != chapter_id]
+        if memo_removed:
+            memos.pop(chapter_id, None)
+            content["memos"] = memos
+
+        _put_review_notes_file(
+            content,
+            sha,
+            message=f"chore(review): cleanup orphaned data for deleted chapter {chapter_id}",
+        )
+        return {"bookmark_removed": bookmark_removed, "memo_removed": memo_removed}
+    except Exception as e:
+        # クリーンアップの失敗は削除操作全体の失敗にはしない。
+        # 呼び出し元のレスポンスに detail として含め、必要なら手動で再実行できるようにする。
+        return {"error": str(e)}
+
+
+class ChapterUpsertRequest(BaseModel):
+    id: str
+    part: str
+    title: str
+    readMinutes: int
+    bodyHtml: str
+
+
+
+
+class MemoRequest(BaseModel):
+    chapter_id: str
+    memo: str
 
 # ============================
 # 外部ファイル URL（Raw）
@@ -1160,3 +1418,201 @@ def chart(ticker: str, timeframe: str = "1d"):
 
     except Exception as e:
         return {"error": "chart failed", "detail": str(e)}
+
+# ============================
+# /review/notes（復習ページ：しおり・メモの読み込み）
+# ============================
+@app.get("/review/notes")
+def get_review_notes():
+    """
+    しおり一覧・章ごとのメモをまとめて返す。
+    閲覧は書き込みと異なり認可不要（既存の /dates 等の読み取り系エンドポイントと同じ扱い）。
+    Raw URL（CDNキャッシュあり）から読むため、直前の書き込み直後は数分程度
+    反映が遅れる場合がある。書き込み直後の画面反映は、POST の応答に含まれる
+    最新状態をそのまま画面へ反映する形にし、本エンドポイントへの再取得には
+    依存しないこと（review.js 側の実装方針。詳細はフロント側コメントを参照）。
+    """
+    try:
+        resp = requests.get(REVIEW_NOTES_RAW_URL)
+        if resp.status_code == 404:
+            return {"status": "ok", **REVIEW_NOTES_DEFAULT}
+        resp.raise_for_status()
+        content = resp.json()
+        return {"status": "ok", **content}
+    except Exception as e:
+        return {"error": "failed to load review notes", "detail": str(e)}
+
+# ============================
+# /review/bookmark（復習ページ：しおりの追加／解除）
+# ============================
+@app.post("/review/bookmark")
+def set_review_bookmark(
+    payload: BookmarkRequest,
+    x_review_secret: str | None = Header(default=None, alias="X-Review-Secret"),
+):
+    """
+    しおりの追加／解除。
+    - bookmarked=true : chapter_id を bookmarks に追加（重複しても1件のみ保持）
+    - bookmarked=false: chapter_id を bookmarks から削除
+    """
+    _require_review_secret(x_review_secret)
+    try:
+        content, sha = _get_review_notes_for_write()
+        bookmarks = set(content.get("bookmarks", []))
+        if payload.bookmarked:
+            bookmarks.add(payload.chapter_id)
+        else:
+            bookmarks.discard(payload.chapter_id)
+        content["bookmarks"] = sorted(bookmarks)
+
+        _put_review_notes_file(
+            content,
+            sha,
+            message=f"chore(review): update bookmark {payload.chapter_id}={payload.bookmarked}",
+        )
+        return {"status": "ok", "bookmarks": content["bookmarks"]}
+    except HTTPException:
+        raise
+    except requests.HTTPError as e:
+        return {"error": "github write failed", "detail": str(e)}
+    except Exception as e:
+        return {"error": "failed to update bookmark", "detail": str(e)}
+
+# ============================
+# /review/memo（復習ページ：章ごとのメモ保存）
+# ============================
+@app.post("/review/memo")
+def set_review_memo(
+    payload: MemoRequest,
+    x_review_secret: str | None = Header(default=None, alias="X-Review-Secret"),
+):
+    """
+    章ごとのメモを全文置き換えで保存する。
+    空文字（前後空白のみ含む）で送信された場合は該当章のメモを削除する。
+    """
+    _require_review_secret(x_review_secret)
+    try:
+        content, sha = _get_review_notes_for_write()
+        memos = content.get("memos", {})
+        if payload.memo.strip() == "":
+            memos.pop(payload.chapter_id, None)
+        else:
+            memos[payload.chapter_id] = payload.memo
+        content["memos"] = memos
+
+        _put_review_notes_file(
+            content,
+            sha,
+            message=f"chore(review): update memo for {payload.chapter_id}",
+        )
+        return {"status": "ok", "memos": content["memos"]}
+    except HTTPException:
+        raise
+    except requests.HTTPError as e:
+        return {"error": "github write failed", "detail": str(e)}
+    except Exception as e:
+        return {"error": "failed to update memo", "detail": str(e)}
+
+# ============================
+# /review/chapters（復習ページ：章コンテンツの読み込み）
+# ============================
+@app.get("/review/chapters")
+def get_review_chapters():
+    """
+    章コンテンツ（目次・本文）一覧を返す。
+    Raw URL 経由で読むため、直前の書き込み直後は数分反映が遅れる場合がある。
+    ファイルがまだ存在しない場合（初回稼働時）は REVIEW_CHAPTERS_DEFAULT を返す。
+    """
+    try:
+        resp = requests.get(REVIEW_CHAPTERS_RAW_URL)
+        if resp.status_code == 404:
+            return {"status": "ok", **REVIEW_CHAPTERS_DEFAULT}
+        resp.raise_for_status()
+        content = resp.json()
+        return {"status": "ok", **content}
+    except Exception as e:
+        return {"error": "failed to load review chapters", "detail": str(e)}
+
+# ============================
+# /review/chapter（復習ページ：章コンテンツの追加・更新・削除）
+# ============================
+@app.post("/review/chapter")
+def upsert_review_chapter(
+    payload: ChapterUpsertRequest,
+    x_review_secret: str | None = Header(default=None, alias="X-Review-Secret"),
+):
+    """
+    章コンテンツの追加・更新（upsert）。
+    - payload.id が既存の章と一致する場合：その章を全項目で上書き（並び順は維持）
+    - 一致しない場合：新しい章として末尾に追加
+    章の id は一度使ったら変更しないこと（しおり・メモが id で紐付いているため、
+    id を変更すると既存のしおり・メモが孤立する）。
+    """
+    _require_review_secret(x_review_secret)
+    try:
+        content, sha = _get_review_chapters_for_write()
+        chapters = content.get("chapters", [])
+
+        new_chapter = payload.model_dump()
+        index = next((i for i, c in enumerate(chapters) if c.get("id") == payload.id), None)
+        if index is not None:
+            chapters[index] = new_chapter
+        else:
+            chapters.append(new_chapter)
+        content["chapters"] = chapters
+
+        _put_review_chapters_file(
+            content,
+            sha,
+            message=f"chore(review): upsert chapter {payload.id}",
+        )
+        return {"status": "ok", "chapters": content["chapters"]}
+    except HTTPException:
+        raise
+    except requests.HTTPError as e:
+        return {"error": "github write failed", "detail": str(e)}
+    except Exception as e:
+        return {"error": "failed to upsert chapter", "detail": str(e)}
+
+
+@app.delete("/review/chapter")
+def delete_review_chapter(
+    chapter_id: str,
+    x_review_secret: str | None = Header(default=None, alias="X-Review-Secret"),
+):
+    """
+    章コンテンツの削除。
+    NOTE: 削除に成功すると、review_notes.json 側に残っている当該 chapter_id の
+    しおり・メモも自動的にあわせて削除する（_cleanup_orphaned_review_data）。
+    このクリーンアップが失敗した場合でも章そのものの削除は成功として扱い、
+    レスポンスの "cleanup" にエラー内容を含める（手動で /review/bookmark・
+    /review/memo を使って個別に整理することも可能）。
+    """
+    _require_review_secret(x_review_secret)
+    try:
+        content, sha = _get_review_chapters_for_write()
+        chapters = content.get("chapters", [])
+        remaining = [c for c in chapters if c.get("id") != chapter_id]
+        if len(remaining) == len(chapters):
+            return {"error": "chapter not found", "detail": chapter_id}
+        content["chapters"] = remaining
+
+        _put_review_chapters_file(
+            content,
+            sha,
+            message=f"chore(review): delete chapter {chapter_id}",
+        )
+
+        cleanup_result = _cleanup_orphaned_review_data(chapter_id)
+
+        return {
+            "status": "ok",
+            "chapters": content["chapters"],
+            "cleanup": cleanup_result,
+        }
+    except HTTPException:
+        raise
+    except requests.HTTPError as e:
+        return {"error": "github write failed", "detail": str(e)}
+    except Exception as e:
+        return {"error": "failed to delete chapter", "detail": str(e)}
