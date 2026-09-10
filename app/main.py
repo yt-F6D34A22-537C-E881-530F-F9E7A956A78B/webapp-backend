@@ -86,10 +86,6 @@ REVIEW_NOTES_CONTENTS_API = (
     f"https://api.github.com/repos/{REVIEW_NOTES_REPO_OWNER}/{REVIEW_NOTES_REPO_NAME}"
     f"/contents/{REVIEW_NOTES_PATH}"
 )
-REVIEW_NOTES_RAW_URL = (
-    f"https://raw.githubusercontent.com/{REVIEW_NOTES_REPO_OWNER}/{REVIEW_NOTES_REPO_NAME}"
-    f"/refs/heads/{REVIEW_NOTES_REPO_BRANCH}/{REVIEW_NOTES_PATH}"
-)
 
 REVIEW_NOTES_DEFAULT = {"bookmarks": [], "memos": {}}
 
@@ -185,10 +181,6 @@ REVIEW_CHAPTERS_PATH = "data/review_chapters.json"
 REVIEW_CHAPTERS_CONTENTS_API = (
     f"https://api.github.com/repos/{REVIEW_NOTES_REPO_OWNER}/{REVIEW_NOTES_REPO_NAME}"
     f"/contents/{REVIEW_CHAPTERS_PATH}"
-)
-REVIEW_CHAPTERS_RAW_URL = (
-    f"https://raw.githubusercontent.com/{REVIEW_NOTES_REPO_OWNER}/{REVIEW_NOTES_REPO_NAME}"
-    f"/refs/heads/{REVIEW_NOTES_REPO_BRANCH}/{REVIEW_CHAPTERS_PATH}"
 )
 
 # data/review_chapters.json がまだ存在しない場合（初回稼働時）の初期コンテンツ。
@@ -1450,29 +1442,6 @@ def chart(ticker: str, timeframe: str = "1d"):
         return {"error": "chart failed", "detail": str(e)}
 
 # ============================
-# /review/notes（復習ページ：しおり・メモの読み込み）
-# ============================
-@app.get("/review/notes")
-def get_review_notes():
-    """
-    しおり一覧・章ごとのメモをまとめて返す。
-    閲覧は書き込みと異なり認可不要（既存の /dates 等の読み取り系エンドポイントと同じ扱い）。
-    Raw URL（CDNキャッシュあり）から読むため、直前の書き込み直後は数分程度
-    反映が遅れる場合がある。書き込み直後の画面反映は、POST の応答に含まれる
-    最新状態をそのまま画面へ反映する形にし、本エンドポイントへの再取得には
-    依存しないこと（review.js 側の実装方針。詳細はフロント側コメントを参照）。
-    """
-    try:
-        resp = requests.get(REVIEW_NOTES_RAW_URL)
-        if resp.status_code == 404:
-            return {"status": "ok", **REVIEW_NOTES_DEFAULT}
-        resp.raise_for_status()
-        content = resp.json()
-        return {"status": "ok", **content}
-    except Exception as e:
-        return {"error": "failed to load review notes", "detail": str(e)}
-
-# ============================
 # /review/bookmark（復習ページ：しおりの追加／解除）
 # ============================
 @app.post("/review/bookmark")
@@ -1542,26 +1511,6 @@ def set_review_memo(
         return {"error": "github write failed", "detail": str(e)}
     except Exception as e:
         return {"error": "failed to update memo", "detail": str(e)}
-
-# ============================
-# /review/chapters（復習ページ：章コンテンツの読み込み）
-# ============================
-@app.get("/review/chapters")
-def get_review_chapters():
-    """
-    章コンテンツ（目次・本文）一覧を返す。
-    Raw URL 経由で読むため、直前の書き込み直後は数分反映が遅れる場合がある。
-    ファイルがまだ存在しない場合（初回稼働時）は REVIEW_CHAPTERS_DEFAULT を返す。
-    """
-    try:
-        resp = requests.get(REVIEW_CHAPTERS_RAW_URL)
-        if resp.status_code == 404:
-            return {"status": "ok", **REVIEW_CHAPTERS_DEFAULT}
-        resp.raise_for_status()
-        content = resp.json()
-        return {"status": "ok", **content}
-    except Exception as e:
-        return {"error": "failed to load review chapters", "detail": str(e)}
 
 # ============================
 # /review/chapter（復習ページ：章コンテンツの追加・更新・削除）
