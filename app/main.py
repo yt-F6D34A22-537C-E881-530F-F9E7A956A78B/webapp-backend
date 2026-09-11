@@ -189,6 +189,7 @@ REVIEW_CHAPTERS_DEFAULT = {
     "chapters": [
         {
             "id": "candlestick-basics",
+            "group": "学びの棚サンプル",
             "part": "第1部　値動きを読む基礎",
             "title": "ローソク足とは何を表すか",
             "readMinutes": 3,
@@ -203,6 +204,7 @@ REVIEW_CHAPTERS_DEFAULT = {
         },
         {
             "id": "shadow-meaning",
+            "group": "学びの棚サンプル",
             "part": "第1部　値動きを読む基礎",
             "title": "上ヒゲ・下ヒゲの意味",
             "readMinutes": 4,
@@ -220,6 +222,7 @@ REVIEW_CHAPTERS_DEFAULT = {
         },
         {
             "id": "volume-meaning",
+            "group": "学びの棚サンプル",
             "part": "第1部　値動きを読む基礎",
             "title": "出来高が語ること",
             "readMinutes": 4,
@@ -235,6 +238,7 @@ REVIEW_CHAPTERS_DEFAULT = {
         },
         {
             "id": "heuristics-design",
+            "group": "学びの棚サンプル",
             "part": "第2部　スクリーニングの考え方",
             "title": "経験則判定の設計思想",
             "readMinutes": 5,
@@ -308,6 +312,7 @@ def _cleanup_orphaned_review_data(chapter_id: str):
 
 class ChapterUpsertRequest(BaseModel):
     id: str
+    group: str
     part: str
     title: str
     readMinutes: int
