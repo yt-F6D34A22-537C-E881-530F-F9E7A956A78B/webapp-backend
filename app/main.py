@@ -851,6 +851,7 @@ def screening(
     mode: str = "ratio",
     volume_ratio: float = 5,
     shadow_ratio: float = 5,
+    min_volume: float = 1_000_000,  # ratio モード用：出来高（当日）の最低条件
     target_date: str = None,
     exclude_markets: str = None,  # カンマ区切りで除外する市場・商品区分
     codes: str = None,            # heuristics 絞り込み／compare 対象銘柄（カンマ区切り）
@@ -919,7 +920,7 @@ def screening(
 
                     shadow_ratio_val = upper_shadow / real_body
 
-                    if vol_ratio_val >= volume_ratio and shadow_ratio_val >= shadow_ratio:
+                    if vol_ratio_val >= volume_ratio and shadow_ratio_val >= shadow_ratio and today_vol >= min_volume:
                         # 前日比（出来高）：(当日出来高 - 前日出来高) / 前日出来高 * 100
                         # vol_ratio_val（当日出来高 / 前日出来高）から導出できるが、
                         # 列見出し「出来高（前日出来高 / 前日比%）」の意味に合わせて
