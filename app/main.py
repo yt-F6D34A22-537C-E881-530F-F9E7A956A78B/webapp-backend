@@ -13,6 +13,7 @@ import time
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from app.heuristics_scoring import calc_heuristics_score
+from app.bollinger import BB_PERIOD, BB_ZONES, DEFAULT_BB_ZONE, calc_bb_area, calc_bb_position, is_in_bb_zone
 
 import yfinance as yf
 warnings.filterwarnings("ignore")
@@ -334,6 +335,7 @@ EXCEL_URL = BASE_URL + "data_j.xlsx"
 RAW_HEURISTICS_PREFIX = BASE_URL + "heuristics/"
 RAW_OHLCV_PREFIX = BASE_URL + "ohlcv/"  # ohlcv_YYYYMMDD.json 形式（2026-07、data.json を置き換え）
 MARKET_CAP_JSON_URL = BASE_URL + "market_cap.json"  # {コード: 発行済株式数} 形式（2026-07 追加）
+RAW_MARGIN_PREFIX = BASE_URL + "margin/"  # margin_YYYYMMDD.json 形式（scripts/margin.js が生成する信用取引データの日次アーカイブ）
 
 # ============================
 # GitHub API URL（BASE_URL から抽出）
@@ -373,6 +375,16 @@ OHLCV_DATES_CACHE_TTL_SEC = 300  # 5分。GitHub trees API のレート制限に
 _ohlcv_content_cache: dict[str, tuple[dict, float]] = {}  # date -> (data, fetched_at)
 OHLCV_TODAY_CACHE_TTL_SEC = 300  # 5分。当日分は fetch.js により1日に複数回上書きされ得るため、
                                   # 恒久的に不変な過去日分とは別に短いTTLを設ける
+
+# ------------------------------------------------------------------
+# margin アーカイブ（margin_bb モード用）：常に「最新1日分」のみを保持する。
+# margin_YYYYMMDD.json は1ファイル＝1日分で書いた後は不変（scripts/margin.js の
+# writeMarginArchive）のため、最新日付が変わらない限り再取得しない。
+# 過去日分は参照しない（要件：検索条件の日付ではなく最新の信用取引データを使う）ため、
+# _ohlcv_content_cache のように日付ごとに蓄積せず、メモリ使用量は一定。
+# ------------------------------------------------------------------
+_margin_latest_cache: dict = {"date": None, "issues": {}, "checked_at": 0.0}
+MARGIN_LATEST_CACHE_TTL_SEC = 300  # 5分。margin.yml の更新は1日2回（JST 19:07 / 22:07）のみ
 
 def load_ticker_list():
     global ticker_list
@@ -478,6 +490,59 @@ def resolve_date_ranking_dates(target_date: str) -> tuple[str | None, str | None
         return None, None
     return target_date, dates[idx + 1]
 
+def list_margin_dates() -> list[str]:
+    """
+    GitHub trees API から data/margin/**/margin_YYYYMMDD.json を抽出し、
+    降順（新しい日付が先頭）で返す。list_ohlcv_dates() と同一パターン。
+    """
+    try:
+        resp = requests.get(GIT_TREE_API, headers=github_headers())
+        resp.raise_for_status()
+        tree = resp.json().get("tree", [])
+        dates = [
+            m.group(1)
+            for item in tree
+            if (m := re.match(r"data/margin/\d{6}/margin_(\d{8})\.json$", item.get("path", "")))
+        ]
+        return sorted(dates, reverse=True)
+    except Exception as e:
+        print("Failed to list margin dates:", e)
+        return []
+
+def fetch_margin_file(date: str) -> dict:
+    """1日分の margin_YYYYMMDD.json の issues（{コード: 信用取引データ}）を取得する。失敗時は空 dict。"""
+    try:
+        resp = requests.get(f"{RAW_MARGIN_PREFIX}{date[:6]}/margin_{date}.json", headers=github_headers())
+        resp.raise_for_status()
+        return json.loads(resp.text).get("issues", {})
+    except Exception as e:
+        print(f"Failed to load margin_{date}.json:", e)
+        return {}
+
+def get_latest_margin() -> tuple[str | None, dict]:
+    """
+    最新の margin アーカイブ（日付, issues）を TTL キャッシュ付きで返す。
+    取得に失敗した場合は、保持している直前のキャッシュ（初回失敗時は (None, {})）を返す。
+    起動時（load_ticker_list() 等と同じ位置）に1回呼び出してキャッシュを温める。
+    """
+    cache = _margin_latest_cache
+    if cache["issues"] and (time.time() - cache["checked_at"]) < MARGIN_LATEST_CACHE_TTL_SEC:
+        return cache["date"], cache["issues"]
+
+    dates = list_margin_dates()
+    if not dates:
+        return cache["date"], cache["issues"]
+
+    latest = dates[0]
+    if latest != cache["date"] or not cache["issues"]:
+        issues = fetch_margin_file(latest)
+        if not issues:
+            return cache["date"], cache["issues"]
+        cache["date"], cache["issues"] = latest, issues
+
+    cache["checked_at"] = time.time()
+    return cache["date"], cache["issues"]
+
 def load_market_cap():
     """
     銘柄ごとの発行済株式数（{コード: 株数}）を market_cap.json から読み込む。
@@ -542,6 +607,7 @@ load_ticker_list()
 load_ohlcv_dates()
 load_market_cap()
 load_trading_dates()
+get_latest_margin()  # margin_bb モード用（最新の信用取引データ）
 
 # ============================
 # ユーティリティ
@@ -758,6 +824,51 @@ def _fetch_block_detection(code: str, target_date: str, threshold_yen: float):
     }
 
 # ============================
+# margin_bb モード（信用需給悪化 × ボリンジャーバンド）
+# ============================
+# 信用倍率（JPX信用倍率＝買残/売残）の下限の既定値
+MARGIN_BB_DEFAULT_RATIO = 5.0
+
+# 買残（JPX信用買残。単位：株）の最低値の既定値。
+# 売残0の銘柄は信用倍率が算出できず null になるため（倍率＝∞として扱い除外しない）、
+# 買残がごく少量の銘柄が混入しないよう、買残の下限で足切りする。
+MARGIN_BB_DEFAULT_MIN_BUY_BALANCE = 100_000
+
+# BB算出に必要な過去日の日次OHLCV（ohlcv_YYYYMMDD.json）を並列取得する際の最大同時実行数
+# （GitHub Raw への同時接続数を抑えるため、他モードと同じ 8 に固定）
+MARGIN_BB_FETCH_MAX_WORKERS = 8
+
+def get_ohlcv_window(target_date: str, days: int) -> list[dict]:
+    """
+    ohlcv アーカイブ上の target_date を先頭とする直近 days 営業日ぶんの日次OHLCVを、
+    新しい順（先頭が target_date）のリストで返す。
+    未キャッシュの日付は並列取得する（キャッシュ済みなら外部通信なし）。
+    アーカイブに target_date が無い・履歴が days 日に満たない・取得に失敗した日がある場合は ValueError。
+    """
+    dates = get_ohlcv_dates()
+    if target_date not in dates:
+        raise ValueError(f"target_date {target_date} is not in ohlcv archive")
+
+    idx = dates.index(target_date)
+    window_dates = dates[idx: idx + days]
+    if len(window_dates) < days:
+        raise ValueError(f"ohlcv history is insufficient: {len(window_dates)} of {days} days")
+
+    with ThreadPoolExecutor(max_workers=min(MARGIN_BB_FETCH_MAX_WORKERS, len(window_dates))) as executor:
+        window = list(executor.map(get_ohlcv_for_date, window_dates))
+
+    # fetch_ohlcv_file() は失敗時に空 dict を返し、get_ohlcv_for_date() はそれを
+    # そのままキャッシュしてしまう（過去日分は無期限）。一時的な通信失敗が
+    # 次回以降も残らないよう、空だった日付のキャッシュを破棄して再取得できるようにする。
+    failed = [d for d, data in zip(window_dates, window) if not data]
+    for d in failed:
+        _ohlcv_content_cache.pop(d, None)
+    if failed:
+        raise ValueError(f"failed to load ohlcv files: {', '.join(failed)}")
+
+    return window
+
+# ============================
 # /dates（プルダウン用）
 # ============================
 @app.get("/dates")
@@ -863,6 +974,11 @@ def screening(
                                      # （既定 false ＝従来通りの2点比較。省略時は無改修で動作）
     threshold_yen: float = None,    # block モード用：単一バーの推定売買代金の検出閾値（円）
     candidate_limit: int = None,    # block モード用：1分足取得の対象とする候補数（日次売買代金上位）
+    margin_ratio: float = None,     # margin_bb モード用：信用倍率（JPX信用倍率＝買残/売残）の下限（省略時 MARGIN_BB_DEFAULT_RATIO）
+    min_buy_balance: float = None,  # margin_bb モード用：買残（JPX信用買残・株）の最低値（省略時 MARGIN_BB_DEFAULT_MIN_BUY_BALANCE）
+    bb_zone: str = None,            # margin_bb モード用：ボリンジャーバンドのエリア（BB_ZONES のキー。省略時 DEFAULT_BB_ZONE＝+3σ以上）
+    ranking_direction: str = "up",  # date_ranking モード用：up＝値上がり率（降順）／down＝値下がり率（昇順）
+                                     # 省略時 up のため、本パラメータを送信しない既存の呼び出しは従来と同一の挙動
 ):
     results = []
 
@@ -957,6 +1073,9 @@ def screening(
         if not target_date:
             return {"error": "target_date is required"}
 
+        if ranking_direction not in ("up", "down"):
+            return {"error": "invalid ranking_direction", "detail": "ranking_direction は up または down を指定してください。"}
+
         try:
             today_key, prev_key = resolve_date_ranking_dates(target_date)
             if not today_key or not prev_key:
@@ -998,7 +1117,9 @@ def screening(
                 except Exception:
                     continue
 
-            results.sort(key=lambda x: x["値上がり率"], reverse=True)
+            # ranking_direction=down（値下がり率ランキング）は同じ「値上がり率」（符号付き騰落率）の
+            # 昇順＝下落率の大きい順。出力フィールド名は互換性のため「値上がり率」のまま（値は負になる）。
+            results.sort(key=lambda x: x["値上がり率"], reverse=(ranking_direction == "up"))
             return {"status": "ok", "data": results[:100]}
 
         except Exception as e:
@@ -1379,6 +1500,99 @@ def screening(
 
         except Exception as e:
             return {"error": "block screening failed", "detail": str(e)}
+
+    # ----------------------------
+    # モード F：信用需給悪化 × ボリンジャーバンド（margin_bb）
+    # ----------------------------
+    elif mode == "margin_bb":
+        if not target_date:
+            return {"error": "target_date is required"}
+
+        zone_key = bb_zone or DEFAULT_BB_ZONE
+        if zone_key not in BB_ZONES:
+            return {"error": "invalid bb_zone", "detail": f"bb_zone は {', '.join(BB_ZONES)} のいずれかを指定してください。"}
+
+        ratio_min = margin_ratio if margin_ratio is not None else MARGIN_BB_DEFAULT_RATIO
+        if ratio_min <= 0:
+            return {"error": "invalid margin_ratio", "detail": "margin_ratio は 0 より大きい数値を指定してください。"}
+
+        buy_min = min_buy_balance if min_buy_balance is not None else MARGIN_BB_DEFAULT_MIN_BUY_BALANCE
+        if buy_min < 0:
+            return {"error": "invalid min_buy_balance", "detail": "min_buy_balance は 0 以上の数値を指定してください。"}
+
+        try:
+            exclude_set = parse_exclude_markets(exclude_markets)
+
+            # 信用取引データは検索条件の日付（target_date）ではなく、常に最新の margin アーカイブを参照する（要件）
+            margin_date, margin_issues = get_latest_margin()
+            if not margin_issues:
+                return {"error": "margin data not found"}
+
+            # BB算出用：target_date を先頭とする直近 BB_PERIOD 営業日の日次OHLCV（新しい順）
+            window = get_ohlcv_window(target_date, BB_PERIOD)
+
+            hits = []  # (並び替えキー, 結果要素)
+            for row in ticker_list:
+                code = str(row["コード"])
+
+                # 除外市場フィルタ（ratio / heuristics / block モードと同一ロジック）
+                market = str(row.get("市場・商品区分", ""))
+                if exclude_set and market in exclude_set:
+                    continue
+
+                issue = margin_issues.get(code)
+                if not issue:
+                    continue
+
+                # 買残の下限（欠損の銘柄は対象外）
+                buy = issue.get("JPX信用買残")
+                sell = issue.get("JPX信用売残")
+                if buy is None or buy < buy_min:
+                    continue
+
+                # 需給悪化：信用倍率が閾値以上。
+                # 倍率 null は「売残0」（買残あり）の場合のみ倍率∞として条件を満たすものとして扱い、
+                # 売残も欠損している（倍率を判断できない）銘柄は除外する
+                ratio = issue.get("JPX信用倍率")
+                if ratio is None:
+                    if sell != 0:
+                        continue
+                elif ratio < ratio_min:
+                    continue
+
+                # 終値列（古い→新しい）。1日でも欠損があれば calc_bb_position が None を返す
+                closes = [(day.get(code) or {}).get("c") for day in reversed(window)]
+                position = calc_bb_position(closes)
+                if position is None or not is_in_bb_zone(position, zone_key):
+                    continue
+
+                margin_status = issue.get("制度信用") or {}
+                # 並び順：BBエリア（σ帯）の降順 → 信用倍率の降順（∞＝売残0 が最上位）
+                sort_key = (calc_bb_area(position), float("inf") if ratio is None else ratio)
+                hits.append((sort_key, {
+                    "コード": code,
+                    "銘柄名": row["銘柄名"],
+                    "時価総額": calc_market_cap(code, closes[-1]),
+                    "終値": closes[-1],
+                    "BB位置": round(position, 2),
+                    "信用倍率": ratio,          # 売残0 の場合は null（JSON は ∞ を表現できないため）
+                    "信用買残": buy,
+                    "信用売残": sell,
+                    "制度信用買い建て": margin_status.get("買い建て"),
+                    "制度信用売り建て": margin_status.get("売り建て"),
+                    "規制": issue.get("規制") or [],
+                }))
+
+            hits.sort(key=lambda h: h[0], reverse=True)
+            return {
+                "status": "ok",
+                "target_date": target_date,
+                "margin_date": margin_date,  # 参照した信用取引データ（最新アーカイブ）の日付
+                "data": [h[1] for h in hits],
+            }
+
+        except Exception as e:
+            return {"error": "margin_bb screening failed", "detail": str(e)}
 
     else:
         return {"error": "invalid mode"}
