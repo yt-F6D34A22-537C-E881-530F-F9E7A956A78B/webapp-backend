@@ -1567,8 +1567,17 @@ def screening(
                     continue
 
                 margin_status = issue.get("制度信用") or {}
-                # 並び順：BBエリア（σ帯）の降順 → 信用倍率の降順（∞＝売残0 が最上位）
-                sort_key = (calc_bb_area(position), float("inf") if ratio is None else ratio)
+                sell_ok = margin_status.get("売り建て")
+                buy_ok = margin_status.get("買い建て")
+                # 並び順：制度信用「売り建て」が○（True）の銘柄が先頭 → 次に「買い建て」が○（True）の銘柄が先頭
+                # → BBエリア（σ帯）の降順 → 信用倍率の降順（∞＝売残0 が最上位）
+                # 値が None（情報なし）の銘柄は ○ ではないため、False と同じ扱い（後方）とする
+                sort_key = (
+                    sell_ok is True,
+                    buy_ok is True,
+                    calc_bb_area(position),
+                    float("inf") if ratio is None else ratio,
+                )
                 hits.append((sort_key, {
                     "コード": code,
                     "銘柄名": row["銘柄名"],
