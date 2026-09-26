@@ -327,6 +327,57 @@ class MemoRequest(BaseModel):
     memo: str
 
 # ============================
+# お気に入りモード：条件の保存（2026-09 追加）
+# ============================
+# 既存の復習ページ機能（review_notes.json 等）と同じ Contents API の仕組みを
+# 踏襲し、data/favorites.json（webapp-frontend リポジトリ）へ保存する。
+# 書き込みトークン（REVIEW_GITHUB_TOKEN）・簡易認可（X-Review-Secret /
+# REVIEW_API_SECRET）・汎用ヘルパー（_get_github_json_for_write /
+# _put_github_json_file）はすべて review 機能のものをそのまま再利用しており、
+# 新規のトークン・環境変数は発行していない（_require_review_secret も共用のため、
+# 合言葉は review 機能と共通の1つになる）。
+FAVORITES_PATH = "data/favorites.json"
+
+FAVORITES_CONTENTS_API = (
+    f"https://api.github.com/repos/{REVIEW_NOTES_REPO_OWNER}/{REVIEW_NOTES_REPO_NAME}"
+    f"/contents/{FAVORITES_PATH}"
+)
+
+FAVORITES_DEFAULT = {}
+
+# お気に入り登録できるモード。1モードにつき条件は1つのみ保持し、
+# 同じモードへの再登録は上書きする（要件：各モードと条件は1対1）。
+# 対象外のモードとその理由：
+# - compare：CSVファイルを保存できないことと、比較元・比較先という他モードと
+#   異なる2日付モデルを持つため（未対応。今回のスコープ外）。
+# - heuristics：結果テーブルが2行ヘッダ・適用ルールのハイライト等、他モードより
+#   大幅に複雑な専用の描画ロジック（screening.js の updateTableHeader/showResults の
+#   heuristics 分岐）を持ち、お気に入りモードの縦積み表示（複数モードの結果を
+#   1ページに並べて表示）へそのまま転用するとフロントエンドの複雑性・保守コストが
+#   大きく増すため、今回のスコープからいったん除外した（将来、該当ロジックを
+#   共通関数へ切り出した上で対応する余地はある）。
+ALLOWED_FAVORITE_MODES = {"ratio", "date", "dateDown", "block", "marginBb"}
+
+
+def _get_favorites_for_write():
+    return _get_github_json_for_write(
+        FAVORITES_CONTENTS_API, REVIEW_NOTES_REPO_BRANCH, FAVORITES_DEFAULT,
+        headers=review_github_headers(),
+    )
+
+
+def _put_favorites_file(content: dict, sha: str | None, message: str):
+    return _put_github_json_file(
+        FAVORITES_CONTENTS_API, REVIEW_NOTES_REPO_BRANCH, content, sha, message,
+        headers=review_github_headers(),
+    )
+
+
+class FavoriteUpsertRequest(BaseModel):
+    mode: str
+    params: dict
+
+# ============================
 # 外部ファイル URL（Raw）
 # ============================
 BASE_URL = "https://raw.githubusercontent.com/yt-F6D34A22-537C-E881-530F-F9E7A956A78B/batches/refs/heads/main/data/"
@@ -1824,3 +1875,71 @@ def delete_review_chapter(
         return {"error": "github write failed", "detail": str(e)}
     except Exception as e:
         return {"error": "failed to delete chapter", "detail": str(e)}
+
+# ============================
+# /favorites（お気に入りモード：条件の保存・解除）
+# ============================
+@app.post("/favorites")
+def upsert_favorite(
+    payload: FavoriteUpsertRequest,
+    x_review_secret: str | None = Header(default=None, alias="X-Review-Secret"),
+):
+    """
+    モード1つぶんのお気に入り条件を保存（上書き）する。
+    同じ mode への再登録は既存の条件を置き換える（1モード1条件）。
+    target_date は保存しない（実行のたびに最新日付を使うため。screening.js を参照）。
+    読み取りは data/favorites.json を GitHub Raw から直接取得する
+    （review_notes.json 等と同じ方針。/favorites に GET は設けていない）。
+    """
+    _require_review_secret(x_review_secret)
+    if payload.mode not in ALLOWED_FAVORITE_MODES:
+        return {
+            "error": "invalid mode",
+            "detail": f"mode は {', '.join(sorted(ALLOWED_FAVORITE_MODES))} のいずれかを指定してください。",
+        }
+    try:
+        content, sha = _get_favorites_for_write()
+        content[payload.mode] = payload.params
+        _put_favorites_file(
+            content,
+            sha,
+            message=f"chore(favorites): update {payload.mode}",
+        )
+        return {"status": "ok", "favorites": content}
+    except HTTPException:
+        raise
+    except requests.HTTPError as e:
+        return {"error": "github write failed", "detail": str(e)}
+    except Exception as e:
+        return {"error": "failed to update favorite", "detail": str(e)}
+
+
+@app.delete("/favorites")
+def delete_favorite(
+    mode: str,
+    x_review_secret: str | None = Header(default=None, alias="X-Review-Secret"),
+):
+    """指定モードのお気に入り条件を削除する。"""
+    _require_review_secret(x_review_secret)
+    if mode not in ALLOWED_FAVORITE_MODES:
+        return {
+            "error": "invalid mode",
+            "detail": f"mode は {', '.join(sorted(ALLOWED_FAVORITE_MODES))} のいずれかを指定してください。",
+        }
+    try:
+        content, sha = _get_favorites_for_write()
+        if mode not in content:
+            return {"error": "favorite not found", "detail": mode}
+        content.pop(mode)
+        _put_favorites_file(
+            content,
+            sha,
+            message=f"chore(favorites): remove {mode}",
+        )
+        return {"status": "ok", "favorites": content}
+    except HTTPException:
+        raise
+    except requests.HTTPError as e:
+        return {"error": "github write failed", "detail": str(e)}
+    except Exception as e:
+        return {"error": "failed to delete favorite", "detail": str(e)}
