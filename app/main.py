@@ -10,6 +10,7 @@ import warnings
 import re
 import os
 import time
+import unicodedata
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from app.heuristics_scoring import calc_heuristics_score
@@ -434,7 +435,7 @@ OHLCV_TODAY_CACHE_TTL_SEC = 300  # 5分。当日分は fetch.js により1日に
 # 過去日分は参照しない（要件：検索条件の日付ではなく最新の信用取引データを使う）ため、
 # _ohlcv_content_cache のように日付ごとに蓄積せず、メモリ使用量は一定。
 # ------------------------------------------------------------------
-_margin_latest_cache: dict = {"date": None, "issues": {}, "checked_at": 0.0}
+_margin_latest_cache: dict = {"date": None, "issues": {}, "meta": {}, "checked_at": 0.0}
 MARGIN_LATEST_CACHE_TTL_SEC = 300  # 5分。margin.yml の更新は1日2回（JST 19:07 / 22:07）のみ
 
 def load_ticker_list():
@@ -560,21 +561,31 @@ def list_margin_dates() -> list[str]:
         print("Failed to list margin dates:", e)
         return []
 
-def fetch_margin_file(date: str) -> dict:
-    """1日分の margin_YYYYMMDD.json の issues（{コード: 信用取引データ}）を取得する。失敗時は空 dict。"""
+def fetch_margin_file(date: str) -> tuple[dict, dict]:
+    """
+    1日分の margin_YYYYMMDD.json を取得する。戻り値は (issues, meta)。失敗時は ({}, {})。
+    2026-09追加：/margin_info が信用残の基準日（meta.jpx_weekly_base_date /
+    meta.jpx_daily_base_date）を参照する必要が生じたため、従来 issues のみを
+    返していたところを meta も合わせて返すよう拡張した（本関数は get_latest_margin()
+    からのみ呼ばれる内部ヘルパーであり、公開APIではないため戻り値の拡張とした）。
+    """
     try:
         resp = requests.get(f"{RAW_MARGIN_PREFIX}{date[:6]}/margin_{date}.json", headers=github_headers())
         resp.raise_for_status()
-        return json.loads(resp.text).get("issues", {})
+        payload = json.loads(resp.text)
+        return payload.get("issues", {}), payload.get("meta", {})
     except Exception as e:
         print(f"Failed to load margin_{date}.json:", e)
-        return {}
+        return {}, {}
 
 def get_latest_margin() -> tuple[str | None, dict]:
     """
     最新の margin アーカイブ（日付, issues）を TTL キャッシュ付きで返す。
     取得に失敗した場合は、保持している直前のキャッシュ（初回失敗時は (None, {})）を返す。
     起動時（load_ticker_list() 等と同じ位置）に1回呼び出してキャッシュを温める。
+    戻り値（date, issues のタプル）は margin_bb モードが利用しているため変更しない。
+    meta（基準日情報）は同じ _margin_latest_cache に保持し、get_latest_margin_meta() から
+    別途取得する（2026-09追加。/margin_info が利用する）。
     """
     cache = _margin_latest_cache
     if cache["issues"] and (time.time() - cache["checked_at"]) < MARGIN_LATEST_CACHE_TTL_SEC:
@@ -586,13 +597,22 @@ def get_latest_margin() -> tuple[str | None, dict]:
 
     latest = dates[0]
     if latest != cache["date"] or not cache["issues"]:
-        issues = fetch_margin_file(latest)
+        issues, meta = fetch_margin_file(latest)
         if not issues:
             return cache["date"], cache["issues"]
-        cache["date"], cache["issues"] = latest, issues
+        cache["date"], cache["issues"], cache["meta"] = latest, issues, meta
 
     cache["checked_at"] = time.time()
     return cache["date"], cache["issues"]
+
+def get_latest_margin_meta() -> dict:
+    """
+    get_latest_margin() と同じキャッシュ（_margin_latest_cache）から meta
+    （jpx_weekly_base_date・jpx_daily_base_date・kubun_base_date）のみを取り出す。
+    本関数単体では外部通信・TTL判定を行わないため、同一リクエスト内で先に
+    get_latest_margin() を呼び出しキャッシュを温めてから使うこと。
+    """
+    return _margin_latest_cache["meta"]
 
 def load_market_cap():
     """
@@ -1656,6 +1676,68 @@ def screening(
 
     else:
         return {"error": "invalid mode"}
+
+# ============================
+# /margin_info（チャートモーダルの信用取引パネル用。2026-09 追加）
+# ============================
+MARGIN_INFO_CODE_PATTERN = re.compile(r"^[0-9A-Z]{4}$")  # margin.js の [0-9A-Z]{4}0 と同じ4桁
+
+
+def _resolve_margin_base_date(issue: dict, meta: dict) -> str | None:
+    """
+    銘柄ごとの信用残の基準日を返す。情報源が「日々公表」の銘柄は
+    meta.jpx_daily_base_date、「通常公表」の銘柄は meta.jpx_weekly_base_date を
+    参照する（backend.margin.archive.meta.purpose を参照）。
+    抽出失敗時（meta にキーが無い・値が null）は None を返す。
+    """
+    key = "jpx_daily_base_date" if issue.get("情報源") == "日々公表" else "jpx_weekly_base_date"
+    return meta.get(key)
+
+
+@app.get("/margin_info")
+def margin_info(code: str):
+    """
+    銘柄1件ぶんの信用取引状況（信用残・前週比・信用倍率・制度信用の建て可否・規制）を返す。
+    信用取引データは検索条件の日付ではなく、常に最新の margin アーカイブ
+    （get_latest_margin）を参照する（margin_bb モードと同じ方針。dataFlow.marginBbScreening を参照）。
+    銘柄名・時価総額は返さない（呼び出し元のチャートモーダルが既に保持しているため。
+    screening.js の openChartModal(ticker, name, index) を参照）。
+    """
+    normalized = unicodedata.normalize("NFKC", code or "").strip().upper()
+    if not MARGIN_INFO_CODE_PATTERN.fullmatch(normalized):
+        return {"error": "invalid code", "detail": "証券コードは英数字4桁で指定してください。"}
+
+    margin_date, margin_issues = get_latest_margin()
+    if not margin_date:
+        return {"error": "margin data not found"}
+
+    issue = margin_issues.get(normalized)
+    if issue is None:
+        # 貸借区分 '0'・取得不可の銘柄は margin.js が出力対象から除外するため、
+        # 「対象外」は異常ではなく正常な状態として found=False で返す。
+        return {"status": "ok", "code": normalized, "margin_date": margin_date, "found": False}
+
+    meta = get_latest_margin_meta()
+    margin_status = issue.get("制度信用") or {}
+    return {
+        "status": "ok",
+        "code": normalized,
+        "margin_date": margin_date,   # 参照した最新 margin アーカイブの日付（銘柄個別の基準日は data.基準日 を参照）
+        "found": True,
+        "data": {
+            "信用買残": issue.get("JPX信用買残"),
+            "信用買残前週比": issue.get("JPX信用買残前週比"),
+            "信用売残": issue.get("JPX信用売残"),
+            "信用売残前週比": issue.get("JPX信用売残前週比"),
+            "信用倍率": issue.get("JPX信用倍率"),   # 売残0の場合は null（margin_bb と同じ表現。∞は表現不可）
+            "制度信用買い建て": margin_status.get("買い建て"),
+            "制度信用売り建て": margin_status.get("売り建て"),
+            "規制": issue.get("規制") or [],
+            "情報源": issue.get("情報源"),
+            "基準日": _resolve_margin_base_date(issue, meta),
+        },
+    }
+
 
 # ============================
 # /chart（週足・月足は日足から生成）
