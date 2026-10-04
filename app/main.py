@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from app.heuristics_scoring import calc_heuristics_score
 from app.bollinger import BB_PERIOD, BB_ZONES, DEFAULT_BB_ZONE, calc_bb_area, calc_bb_position, is_in_bb_zone
+from app.symbol_search import parse_codes, normalize_name, MAX_CODES, MAX_NAME_LENGTH, MAX_RESULTS
 
 import yfinance as yf
 warnings.filterwarnings("ignore")
@@ -1050,6 +1051,7 @@ def screening(
     bb_zone: str = None,            # margin_bb モード用：ボリンジャーバンドのエリア（BB_ZONES のキー。省略時 DEFAULT_BB_ZONE＝+3σ以上）
     ranking_direction: str = "up",  # date_ranking モード用：up＝値上がり率（降順）／down＝値下がり率（昇順）
                                      # 省略時 up のため、本パラメータを送信しない既存の呼び出しは従来と同一の挙動
+    name: str = None,               # symbol_search モード用：銘柄名（あいまい検索）。証券コードは既存の codes を共用
 ):
     results = []
 
@@ -1673,6 +1675,102 @@ def screening(
 
         except Exception as e:
             return {"error": "margin_bb screening failed", "detail": str(e)}
+
+    # ----------------------------
+    # モード G：銘柄検索（symbol_search）
+    #   証券コード（完全一致・カンマ区切り）または銘柄名（あいまい）のいずれかに合致する銘柄を、
+    #   margin_bb と同一の項目で返す。margin_bb と異なり、信用倍率・買残・BB位置による絞り込みは行わず、
+    #   信用データ・日足が欠損している銘柄も欠損値（null）のまま結果に含める。
+    # ----------------------------
+    elif mode == "symbol_search":
+        if not target_date:
+            return {"error": "target_date is required"}
+
+        # --- 入力検証（公開 API のため、形式・件数・長さをサーバー側で制限する） ---
+        code_list, invalid_codes = parse_codes(codes)
+        if invalid_codes:
+            return {"error": "invalid codes", "detail": ",".join(invalid_codes)[:100]}
+        if len(code_list) > MAX_CODES:
+            return {"error": "too many codes", "detail": f"codes は {MAX_CODES} 件以内で指定してください。"}
+        if name and len(name) > MAX_NAME_LENGTH:
+            return {"error": "name is too long", "detail": f"name は {MAX_NAME_LENGTH} 文字以内で指定してください。"}
+        name_query = normalize_name(name)
+        if not code_list and not name_query:
+            return {"error": "codes or name is required"}
+
+        try:
+            # --- 検索：コードと銘柄名は OR 条件（いずれかに合致すれば対象） ---
+            code_set = set(code_list)
+            found_codes = set()   # codes のうち ticker_list に存在したもの（該当なしコードの通知用）
+            matched = []          # (並び替えキー, コード, ticker_list の行)
+            for row in ticker_list:
+                code = str(row["コード"])
+                by_code = code in code_set
+                by_name = bool(name_query) and name_query in normalize_name(row["銘柄名"])
+                if not (by_code or by_name):
+                    continue
+                if by_code:
+                    found_codes.add(code)
+                # 並び順：コード指定の該当銘柄（指定順）→ 銘柄名のみの該当銘柄（コード昇順）
+                sort_key = (0, code_list.index(code)) if by_code else (1, code)
+                matched.append((sort_key, code, row))
+
+            matched.sort(key=lambda m: m[0])
+            truncated = len(matched) > MAX_RESULTS
+            matched = matched[:MAX_RESULTS]
+            not_found_codes = [c for c in code_list if c not in found_codes]
+
+            if not matched:  # 0件なら信用データ・日足の取得（外部通信）を省く
+                return {
+                    "status": "ok",
+                    "target_date": target_date,
+                    "margin_date": None,
+                    "truncated": False,
+                    "not_found_codes": not_found_codes,
+                    "data": [],
+                }
+
+            # 信用取引データは margin_bb と同様、常に最新の margin アーカイブを参照する
+            margin_date, margin_issues = get_latest_margin()
+            if not margin_issues:
+                return {"error": "margin data not found"}
+
+            # BB算出用：target_date を先頭とする直近 BB_PERIOD 営業日の日次OHLCV（新しい順）
+            window = get_ohlcv_window(target_date, BB_PERIOD)
+
+            results = []
+            for _, code, row in matched:
+                # 終値列（古い→新しい）。1日でも欠損があれば calc_bb_position が None を返す
+                closes = [(day.get(code) or {}).get("c") for day in reversed(window)]
+                position = calc_bb_position(closes)
+
+                issue = margin_issues.get(code) or {}   # 信用データが無い銘柄は空 dict（信用関連はすべて null）
+                margin_status = issue.get("制度信用") or {}
+                results.append({
+                    "コード": code,
+                    "銘柄名": row["銘柄名"],
+                    "時価総額": calc_market_cap(code, closes[-1]),
+                    "終値": closes[-1],
+                    "BB位置": round(position, 2) if position is not None else None,
+                    "信用倍率": issue.get("JPX信用倍率"),   # 売残0 は null（margin_bb と同じ表現）
+                    "信用買残": issue.get("JPX信用買残"),
+                    "信用売残": issue.get("JPX信用売残"),   # null なら「信用データなし」（フロントが倍率 null と区別する）
+                    "制度信用買い建て": margin_status.get("買い建て"),
+                    "制度信用売り建て": margin_status.get("売り建て"),
+                    "規制": issue.get("規制") or [],
+                })
+
+            return {
+                "status": "ok",
+                "target_date": target_date,
+                "margin_date": margin_date,   # 参照した信用取引データ（最新アーカイブ）の日付
+                "truncated": truncated,
+                "not_found_codes": not_found_codes,
+                "data": results,
+            }
+
+        except Exception as e:
+            return {"error": "symbol_search failed", "detail": str(e)}
 
     else:
         return {"error": "invalid mode"}
