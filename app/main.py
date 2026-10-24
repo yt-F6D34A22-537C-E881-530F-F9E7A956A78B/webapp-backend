@@ -1837,6 +1837,64 @@ def margin_info(code: str):
     }
 
 
+# /chart：yfinance の日足の最新側を ohlcv アーカイブの値で上書き・補完する最大日数
+# （アーカイブの新しい日付から数えた日数。2026-10 追加）
+CHART_ARCHIVE_OVERLAY_MAX_DAYS = 5
+
+def overlay_archive_on_daily(df: pd.DataFrame, ticker: str) -> tuple[pd.DataFrame, list[str]]:
+    """
+    /chart 用：yfinance から取得した日足 df の最新側を、ohlcv アーカイブ（ohlcv_YYYYMMDD.json）の
+    値で上書き・補完する（2026-10 追加）。
+    スクリーニングは ohlcv アーカイブの当日分を使う一方、チャートは yfinance の日足を使っており、
+    yfinance 側のデータ反映にラグがあると、スクリーニング結果とチャートの最新足が乖離することがあった。
+    その乖離を防ぐため、アーカイブの新しい日付から最大 CHART_ARCHIVE_OVERLAY_MAX_DAYS 日分のうち、
+      ・アーカイブの最新日付（スクリーニングが使う日付）：yfinance の値の有無にかかわらず上書き／追加
+      ・yfinance の最終日付以降の日付：yfinance に無い日を補完（最終日付自身は上書き）
+    を行う。過去側の日付には触れない。
+    アーカイブの当日分は get_ohlcv_for_date() の TTL（OHLCV_TODAY_CACHE_TTL_SEC）でキャッシュされる。
+    取得失敗・銘柄なし・値に null を含む場合は、その日付は yfinance の値のまま（何もしない）。
+    予期しない例外が起きても /chart を失敗させず、元の df をそのまま返す。
+    戻り値: (補正後の df, アーカイブの値で上書き・補完した日付（YYYY-MM-DD）のリスト)
+    """
+    try:
+        dates = get_ohlcv_dates()  # 降順（新しい日付が先頭）
+        if not dates or df.empty:
+            return df, []
+
+        yf_last = df.index.max().strftime("%Y%m%d")
+        latest = dates[0]
+        targets = [d for d in dates[:CHART_ARCHIVE_OVERLAY_MAX_DAYS] if d >= yf_last or d == latest]
+
+        out = df.copy()
+        overlaid = []
+        for d in sorted(targets):
+            data = get_ohlcv_for_date(d)
+            if not data:
+                # 取得失敗が空 dict のまま無期限キャッシュされないよう破棄する（get_ohlcv_window() と同じ考え方）
+                _ohlcv_content_cache.pop(d, None)
+                continue
+
+            entry = data.get(str(ticker))
+            if not entry:
+                continue
+
+            values = [entry.get(k) for k in ("o", "h", "l", "c", "v")]
+            if any(v is None for v in values):
+                continue
+
+            ts = pd.Timestamp(d)
+            if out.index.tz is not None:
+                ts = ts.tz_localize(out.index.tz)
+            out.loc[ts, ["Open", "High", "Low", "Close", "Volume"]] = [float(v) for v in values]
+            overlaid.append(ts.strftime("%Y-%m-%d"))
+
+        if overlaid:
+            out = out.sort_index()
+        return out, overlaid
+    except Exception as e:
+        print(f"Failed to overlay ohlcv archive on chart ({ticker}):", e)
+        return df, []
+
 # ============================
 # /chart（週足・月足は日足から生成）
 # ============================
@@ -1858,6 +1916,16 @@ def chart(ticker: str, timeframe: str = "1d"):
 
         df.index = pd.to_datetime(df.index, errors="coerce")
         df = df.dropna(subset=["Open", "High", "Low", "Close"])
+
+        # 最新側を ohlcv アーカイブの値で上書き・補完する（2026-10 追加）。
+        # 週足・月足は下で日足から生成するため、その前に適用して最新の週・月にも反映させる。
+        df, overlay_dates = overlay_archive_on_daily(df, ticker)
+        # 日足の最終バーがアーカイブ由来か（レスポンスの latest_source。1wk/1mo でも日足の最終バーを指す）
+        latest_source = (
+            "ohlcv_archive"
+            if (not df.empty and df.index.max().strftime("%Y-%m-%d") in overlay_dates)
+            else "yfinance"
+        )
 
         # ---- 週足（W-FRI）----
         df_week = df.resample("W-FRI").agg({
@@ -1896,6 +1964,9 @@ def chart(ticker: str, timeframe: str = "1d"):
             "Low": df_out["Low"].to_dict(),
             "Close": df_out["Close"].to_dict(),
             "Volume": df_out["Volume"].to_dict(),
+            # 2026-10 追加（既存キーは変更なし）：日足の最終バーの取得元と、アーカイブで上書き・補完した日付
+            "latest_source": latest_source,
+            "overlay_dates": overlay_dates,
         }
 
     except Exception as e:
