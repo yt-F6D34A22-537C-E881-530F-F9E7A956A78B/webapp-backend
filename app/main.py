@@ -11,11 +11,18 @@ import re
 import os
 import time
 import unicodedata
+import random
+import threading
+from collections import OrderedDict
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from app.heuristics_scoring import calc_heuristics_score
 from app.bollinger import BB_PERIOD, BB_ZONES, DEFAULT_BB_ZONE, calc_bb_area, calc_bb_position, is_in_bb_zone
 from app.symbol_search import parse_codes, normalize_name, MAX_CODES, MAX_NAME_LENGTH, MAX_RESULTS
+from app.quiz import (
+    QUIZ_JUDGE_DAYS, QUIZ_MAX_ATTEMPTS, build_filters, pick_candidates, filter_answerable,
+    format_date_key, judge_direction, calc_change_pct, evaluate_guess,
+)
 
 import yfinance as yf
 warnings.filterwarnings("ignore")
@@ -1899,7 +1906,16 @@ def overlay_archive_on_daily(df: pd.DataFrame, ticker: str) -> tuple[pd.DataFram
 # /chart（週足・月足は日足から生成）
 # ============================
 @app.get("/chart")
-def chart(ticker: str, timeframe: str = "1d"):
+def chart(ticker: str, timeframe: str = "1d", end_date: str = None):
+    # end_date（YYYY-MM-DD。2026-10 追加。値動きクイズ用）：指定した日付「以前」のバーだけを返す。
+    # 省略時は従来と完全に同一の挙動（最新までのデータ）。
+    end_ts = None
+    if end_date is not None:
+        try:
+            end_ts = pd.Timestamp(datetime.strptime(end_date, "%Y-%m-%d"))
+        except ValueError:
+            return {"error": "invalid end_date", "detail": "end_date は YYYY-MM-DD 形式で指定してください。"}
+
     try:
         symbol = f"{ticker}.T"
 
@@ -1920,6 +1936,19 @@ def chart(ticker: str, timeframe: str = "1d"):
         # 最新側を ohlcv アーカイブの値で上書き・補完する（2026-10 追加）。
         # 週足・月足は下で日足から生成するため、その前に適用して最新の週・月にも反映させる。
         df, overlay_dates = overlay_archive_on_daily(df, ticker)
+
+        # end_date 指定時は、アーカイブ補正の後・週足/月足の生成の前に切り詰める
+        # （2026-10 追加）。補正の前に切り詰めると、補正処理が end_date より後の
+        # アーカイブ日付を追加してしまうため、順序はこの位置で固定すること。
+        # 週足・月足は切り詰め後の日足から生成するため、最終の週・月も end_date までの
+        # 部分足になり、end_date より後の値動きが混ざらない。
+        if end_ts is not None:
+            if df.index.tz is not None:
+                end_ts = end_ts.tz_localize(df.index.tz)
+            df = df[df.index <= end_ts]
+            if df.empty:
+                return {"error": "no data"}
+
         # 日足の最終バーがアーカイブ由来か（レスポンスの latest_source。1wk/1mo でも日足の最終バーを指す）
         latest_source = (
             "ohlcv_archive"
@@ -1971,6 +2000,171 @@ def chart(ticker: str, timeframe: str = "1d"):
 
     except Exception as e:
         return {"error": "chart failed", "detail": str(e)}
+
+# ============================
+# 値動きクイズ（2026-10 追加）
+#   GET /quiz/dates    出題日として選べる日付の一覧（降順）と判定日数
+#   GET /quiz/question 条件に合う銘柄をランダムに1問出題（答えは返さない）
+#   GET /quiz/answer   回答の正誤判定（出題日の終値と、アーカイブ上で judge_days 日後の終値を比較）
+# 出題・判定はいずれも ohlcv アーカイブ（ohlcv_YYYYMMDD.json）と market_cap.json、
+# 銘柄一覧（ticker_list）のみを使う（スクリーニングと同じデータソース）。
+# チャート表示は既存の /chart（end_date 指定）を使う。
+# ============================
+
+# 値動きクイズ専用の ohlcv 取得キャッシュ（最大 QUIZ_OHLCV_CACHE_MAX 日分の LRU）。
+# 既存の _ohlcv_content_cache は日付ごとに無期限で蓄積する設計のため、日付をランダムに
+# 引くクイズで使うと Render（無料枠・低メモリ）でメモリが際限なく増える恐れがある。
+# クイズが引く日付は出題可能日（最新から judge_days 日より前）に限られ、内容は不変のため
+# TTL は不要。取得失敗（空 dict）はキャッシュしない。
+QUIZ_OHLCV_CACHE_MAX = 6
+_quiz_ohlcv_cache: "OrderedDict[str, dict]" = OrderedDict()
+_quiz_ohlcv_cache_lock = threading.Lock()
+
+def get_ohlcv_for_quiz(date: str) -> dict:
+    """値動きクイズ用に1日分の ohlcv を取得する（LRU キャッシュ。失敗時は空 dict）。"""
+    with _quiz_ohlcv_cache_lock:
+        if date in _quiz_ohlcv_cache:
+            _quiz_ohlcv_cache.move_to_end(date)
+            return _quiz_ohlcv_cache[date]
+
+    data = fetch_ohlcv_file(date)  # 通信はロックの外で行う
+    if data:
+        with _quiz_ohlcv_cache_lock:
+            _quiz_ohlcv_cache[date] = data
+            _quiz_ohlcv_cache.move_to_end(date)
+            while len(_quiz_ohlcv_cache) > QUIZ_OHLCV_CACHE_MAX:
+                _quiz_ohlcv_cache.popitem(last=False)
+    return data
+
+def quiz_judge_date_key(dates: list[str], target_date: str) -> str | None:
+    """
+    アーカイブ日付一覧（降順）上で、target_date より QUIZ_JUDGE_DAYS 日後の日付を返す。
+    target_date が一覧に無い、または後ろに十分な日付が無い（＝判定できない）場合は None。
+    """
+    if target_date not in dates:
+        return None
+    judge_index = dates.index(target_date) - QUIZ_JUDGE_DAYS
+    return dates[judge_index] if judge_index >= 0 else None
+
+QUIZ_DATE_KEY_PATTERN = re.compile(r"^\d{8}$")
+QUIZ_CODE_PATTERN = re.compile(r"^[0-9A-Z]{4}$")
+
+@app.get("/quiz/dates")
+def quiz_dates():
+    """出題日として選べる日付（YYYYMMDD・降順）。最新の judge_days 日分は判定できないため除く。"""
+    try:
+        dates = get_ohlcv_dates()
+        eligible = dates[QUIZ_JUDGE_DAYS:]
+        if not eligible:
+            return {"error": "no ohlcv date data"}
+        return {"status": "ok", "dates": eligible, "judge_days": QUIZ_JUDGE_DAYS}
+    except Exception as e:
+        return {"error": "failed to load quiz dates", "detail": str(e)}
+
+@app.get("/quiz/question")
+def quiz_question(
+    target_date: str = None,        # 出題日（YYYYMMDD）。省略時は出題可能日からランダム
+    min_volume: float = None,       # 出来高（株）の下限。省略時は絞り込まない
+    min_trade_value: float = None,  # 売買金額（円。終値×出来高）の下限。省略時は絞り込まない
+    market_cap_band: str = None,    # 時価総額帯（app.quiz.MARKET_CAP_BANDS のキー）。省略時は絞り込まない
+    symbol: str = None,             # 証券コード（カンマ区切り可）または銘柄名。省略時は絞り込まない
+):
+    filters, message = build_filters(min_volume, min_trade_value, market_cap_band, symbol)
+    if message:
+        return {"error": "invalid parameter", "detail": message}
+
+    try:
+        dates = get_ohlcv_dates()  # 降順（新しい日付が先頭）
+        eligible = dates[QUIZ_JUDGE_DAYS:]
+        if not eligible:
+            return {"error": "no ohlcv date data"}
+
+        if target_date:
+            if not QUIZ_DATE_KEY_PATTERN.fullmatch(target_date) or target_date not in eligible:
+                return {"error": "invalid target_date", "detail": "指定した日付は出題できません。"}
+            attempts = [target_date]
+        else:
+            attempts = random.sample(eligible, min(QUIZ_MAX_ATTEMPTS, len(eligible)))
+
+        loaded_any = False
+        for date_key in attempts:
+            day_data = get_ohlcv_for_quiz(date_key)
+            if not day_data:
+                continue
+            loaded_any = True
+
+            candidates = pick_candidates(ticker_list, day_data, market_cap_json, filters)
+            if not candidates:
+                continue  # 判定日ファイルの取得（外部通信）は候補があるときだけ行う
+
+            judge_key = quiz_judge_date_key(dates, date_key)
+            judge_data = get_ohlcv_for_quiz(judge_key) if judge_key else {}
+            candidates = filter_answerable(candidates, judge_data)
+            if not candidates:
+                continue
+
+            picked = random.choice(candidates)
+            return {
+                "status": "ok",
+                "question": {
+                    "code": picked["code"],
+                    "name": picked["name"],
+                    "target_date": format_date_key(date_key),
+                    "judge_days": QUIZ_JUDGE_DAYS,
+                    "candidate_count": len(candidates),
+                },
+            }
+
+        if not loaded_any:
+            return {"error": "failed to load ohlcv"}
+        # 条件に合う銘柄が無かった（エラーではない）。フロントは条件を緩めるよう案内する。
+        return {"status": "ok", "question": None}
+
+    except Exception as e:
+        return {"error": "quiz question failed", "detail": str(e)}
+
+@app.get("/quiz/answer")
+def quiz_answer(code: str, target_date: str, guess: str):
+    code = (code or "").strip().upper()
+    if not QUIZ_CODE_PATTERN.fullmatch(code):
+        return {"error": "invalid code"}
+    if not QUIZ_DATE_KEY_PATTERN.fullmatch(target_date or ""):
+        return {"error": "invalid target_date"}
+    if guess not in ("up", "down"):
+        return {"error": "invalid guess", "detail": "guess は up または down を指定してください。"}
+
+    try:
+        dates = get_ohlcv_dates()
+        judge_key = quiz_judge_date_key(dates, target_date)
+        if not judge_key:
+            return {"error": "invalid target_date", "detail": "指定した日付は判定できません。"}
+
+        day_data = get_ohlcv_for_quiz(target_date)
+        judge_data = get_ohlcv_for_quiz(judge_key)
+        if not day_data or not judge_data:
+            return {"error": "failed to load ohlcv"}
+
+        base_close = (day_data.get(code) or {}).get("c")
+        judge_close = (judge_data.get(code) or {}).get("c")
+        if not base_close or not judge_close or base_close <= 0 or judge_close <= 0:
+            return {"error": "price not found", "detail": "判定に必要な終値が見つかりませんでした。"}
+
+        direction = judge_direction(base_close, judge_close)
+        return {
+            "status": "ok",
+            "code": code,
+            "target_date": format_date_key(target_date),
+            "judge_date": format_date_key(judge_key),   # フロントはこの日付までチャートを延ばして答えを見せる
+            "judge_days": QUIZ_JUDGE_DAYS,
+            "base_close": base_close,
+            "judge_close": judge_close,
+            "change_pct": calc_change_pct(base_close, judge_close),
+            "direction": direction,                      # up / down / flat
+            "guess": guess,
+            "correct": evaluate_guess(direction, guess),  # true / false / null（同値＝引き分け）
+        }
+    except Exception as e:
+        return {"error": "quiz answer failed", "detail": str(e)}
 
 # ============================
 # /review/bookmark（復習ページ：しおりの追加／解除）
