@@ -697,6 +697,19 @@ def parse_exclude_markets(exclude_markets: str) -> set:
         return set()
     return {m.strip() for m in exclude_markets.split(",") if m.strip()}
 
+def get_market_segment(ticker_row: dict) -> str | None:
+    """
+    ticker_list の1行から「市場・商品区分」を取得して返す（例：「プライム（内国株式）」「ETF・ETN」）。
+    列が無い・欠損（pd.read_excel 由来の NaN）・空文字の場合は None を返す。
+    画面表示用の短縮・絞り込み（プライム／スタンダード／グロースのみ表示）は
+    フロントエンド（screening.js の MARKET_SEGMENT_LABELS）の責務とし、
+    API は元の区分名をそのまま返す（CSV 出力でも元の区分名を使うため）。
+    """
+    value = ticker_row.get("市場・商品区分")
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value.strip()
+
 # compare モード：銘柄ごとの終値取得（yfinance 通信）を並列実行する際の
 # 最大同時実行数。大きくしすぎると Yahoo Finance 側のレート制限に
 # 抵触しやすくなるため、あえて小さめの値に固定している。
@@ -1126,6 +1139,7 @@ def screening(
                         results.append({
                             "コード": code,
                             "銘柄名": name,
+                            "市場区分": get_market_segment(row),
                             "時価総額": calc_market_cap(code, close),
                             "終値": close,
                             "出来高": int(today_vol),
@@ -1187,6 +1201,7 @@ def screening(
                     results.append({
                         "コード": code,
                         "銘柄名": name,
+                        "市場区分": get_market_segment(row),
                         "時価総額": calc_market_cap(code, today_close),
                         "値上がり率": round(change_rate, 2),
                         "当日終値": today_close,
@@ -1257,6 +1272,7 @@ def screening(
                 array_data.append({
                     "コード":       code_str,
                     "銘柄名":       name,
+                    "市場区分":     get_market_segment(ticker_row),
                     "時価総額":     calc_market_cap(code_str, price_for_cap),
                     "アップスコア": score["up"],
                     "ダウンスコア": score["down"],
@@ -1346,6 +1362,7 @@ def screening(
             # yfinance への通信を発生させない（従来の挙動を踏襲）
             valid_codes = []
             code_name_map = {}
+            code_market_map = {}   # コード → 市場区分（銘柄名と同様に ticker_list から1回で取得）
             for code in codes_list:
                 ticker_row = next(
                     (r for r in ticker_list if str(r["コード"]) == code),
@@ -1355,6 +1372,7 @@ def screening(
                     continue
                 valid_codes.append(code)
                 code_name_map[code] = ticker_row["銘柄名"]
+                code_market_map[code] = get_market_segment(ticker_row)
 
             # 銘柄ごとの終値取得（yfinance 通信）を並列実行する。
             # 直列ループだと「1銘柄あたりの通信時間 × 銘柄数」がそのまま
@@ -1384,12 +1402,14 @@ def screening(
 
             for code in valid_codes:
                 name = code_name_map[code]
+                market_segment = code_market_map[code]
                 from_close, close_map = price_data.get(code, (None, {}))
 
                 if from_close is None:
                     results.append({
                         "コード": code,
                         "銘柄名": name,
+                        "市場区分": market_segment,
                         "時価総額": None,
                         "error": "終値データを取得できませんでした",
                     })
@@ -1420,6 +1440,7 @@ def screening(
                             results.append({
                                 "コード": code,
                                 "銘柄名": name,
+                                "市場区分": market_segment,
                                 "時価総額": market_cap,
                                 "比較先日付": target_date,
                                 "比較元終値": from_close,
@@ -1434,6 +1455,7 @@ def screening(
                         results.append({
                             "コード": code,
                             "銘柄名": name,
+                            "市場区分": market_segment,
                             "時価総額": market_cap,
                             "比較先日付": target_date,
                             "比較元終値": from_close,
@@ -1456,6 +1478,7 @@ def screening(
                     results.append({
                         "コード": code,
                         "銘柄名": name,
+                        "市場区分": market_segment,
                         "時価総額": market_cap,
                         "比較元終値": from_close,
                         "予測": prediction,
@@ -1469,6 +1492,7 @@ def screening(
                 results.append({
                     "コード": code,
                     "銘柄名": name,
+                    "市場区分": market_segment,
                     "時価総額": market_cap,
                     "比較元終値": from_close,
                     "比較先終値": to_close,
@@ -1534,6 +1558,7 @@ def screening(
                 candidates.append({
                     "コード": code,
                     "銘柄名": name,
+                    "市場区分": get_market_segment(row),
                     "日次売買代金": volume * close,
                     "終値": close,
                 })
@@ -1570,6 +1595,7 @@ def screening(
                     results.append({
                         "コード": cand["コード"],
                         "銘柄名": cand["銘柄名"],
+                        "市場区分": cand["市場区分"],
                         "時価総額": calc_market_cap(cand["コード"], cand["終値"]),
                         "日次売買代金": round(cand["日次売買代金"], 0),
                         **detection,
@@ -1661,6 +1687,7 @@ def screening(
                 hits.append((sort_key, {
                     "コード": code,
                     "銘柄名": row["銘柄名"],
+                    "市場区分": get_market_segment(row),
                     "時価総額": calc_market_cap(code, closes[-1]),
                     "終値": closes[-1],
                     "BB位置": round(position, 2),
@@ -1756,6 +1783,7 @@ def screening(
                 results.append({
                     "コード": code,
                     "銘柄名": row["銘柄名"],
+                    "市場区分": get_market_segment(row),
                     "時価総額": calc_market_cap(code, closes[-1]),
                     "終値": closes[-1],
                     "BB位置": round(position, 2) if position is not None else None,
