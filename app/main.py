@@ -19,6 +19,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from app.heuristics_scoring import calc_heuristics_score
 from app.bollinger import BB_PERIOD, BB_ZONES, DEFAULT_BB_ZONE, calc_bb_area, calc_bb_position, is_in_bb_zone
 from app.symbol_search import parse_codes, normalize_name, MAX_CODES, MAX_NAME_LENGTH, MAX_RESULTS
+from app.short_entry import parse_stage_filter, build_item, sort_items
 from app.quiz import (
     QUIZ_JUDGE_DAYS, QUIZ_MAX_ATTEMPTS, build_filters, pick_candidates, filter_answerable,
     format_date_key, judge_direction, calc_change_pct, evaluate_guess,
@@ -396,6 +397,7 @@ RAW_HEURISTICS_PREFIX = BASE_URL + "heuristics/"
 RAW_OHLCV_PREFIX = BASE_URL + "ohlcv/"  # ohlcv_YYYYMMDD.json 形式（2026-07、data.json を置き換え）
 MARKET_CAP_JSON_URL = BASE_URL + "market_cap.json"  # {コード: 発行済株式数} 形式（2026-07 追加）
 RAW_MARGIN_PREFIX = BASE_URL + "margin/"  # margin_YYYYMMDD.json 形式（scripts/margin.js が生成する信用取引データの日次アーカイブ）
+RAW_SHORT_ENTRY_PREFIX = BASE_URL + "short_entry/"  # short_entry_YYYYMMDD.json 形式（scripts/short_entry.js が生成する空売りエントリー検出の日次アーカイブ）
 
 # ============================
 # GitHub API URL（BASE_URL から抽出）
@@ -1047,6 +1049,44 @@ def get_heuristics_dates():
         return {"error": "exception", "detail": str(e)}
 
 # ============================
+# /short_entry_dates
+# ============================
+@app.get("/short_entry_dates")
+def get_short_entry_dates():
+    """
+    GitHub trees API を1回だけ叩き、
+    data/short_entry/**/short_entry_YYYYMMDD.json を抽出（/heuristics_dates と同一パターン）。
+    エラー時は詳細を返却する。
+    Token を付与して rate limit を回避。
+    """
+    try:
+        resp = requests.get(GIT_TREE_API, headers=github_headers())
+        if resp.status_code != 200:
+            return {
+                "error": "GitHub API error",
+                "status": resp.status_code,
+                "detail": resp.text
+            }
+
+        tree = resp.json().get("tree", [])
+        dates = []
+
+        for item in tree:
+            path = item.get("path", "")
+            # data/short_entry/202610/short_entry_20261023.json
+            m = re.match(r"data/short_entry/\d{6}/short_entry_(\d{8})\.json$", path)
+            if m:
+                dates.append(m.group(1))
+
+        return {
+            "status": "ok",
+            "dates": sorted(dates, reverse=True)
+        }
+
+    except Exception as e:
+        return {"error": "exception", "detail": str(e)}
+
+# ============================
 # /screening（ratio + date_ranking + heuristics）
 # ============================
 @app.get("/screening")
@@ -1072,6 +1112,7 @@ def screening(
     ranking_direction: str = "up",  # date_ranking モード用：up＝値上がり率（降順）／down＝値下がり率（昇順）
                                      # 省略時 up のため、本パラメータを送信しない既存の呼び出しは従来と同一の挙動
     name: str = None,               # symbol_search モード用：銘柄名（あいまい検索）。証券コードは既存の codes を共用
+    stage: str = None,              # short_entry モード用：all（監視＋エントリー）／entry（エントリーのみ）。省略時 all
 ):
     results = []
 
@@ -1806,6 +1847,68 @@ def screening(
 
         except Exception as e:
             return {"error": "symbol_search failed", "detail": str(e)}
+
+    # ----------------------------
+    # モード H：空売りエントリー検出（short_entry）
+    #   scripts/short_entry.js が生成した short_entry_YYYYMMDD.json（日次アーカイブ）を読み、
+    #   ヘッド・アンド・ショルダーズ・トップ後の「50日線での反発失敗」を監視／エントリーとして返す。
+    #   検出は生成側（Actions）で済んでおり、ここでは ohlcv の再計算を行わない
+    #   （時価総額の算出に使う終値も JSON 内の close を用いるため、ohlcv ファイルの取得も不要）。
+    # ----------------------------
+    elif mode == "short_entry":
+        if not target_date:
+            return {"error": "target_date is required"}
+        if not re.fullmatch(r"\d{8}", target_date):
+            return {"error": "invalid target_date", "detail": "target_date は YYYYMMDD 形式で指定してください。"}
+
+        stage_filter, stage_error = parse_stage_filter(stage)
+        if stage_error:
+            return {"error": "invalid stage", "detail": stage_error}
+
+        try:
+            exclude_set = parse_exclude_markets(exclude_markets)
+
+            raw_url = f"{RAW_SHORT_ENTRY_PREFIX}{target_date[:6]}/short_entry_{target_date}.json"
+            resp = requests.get(raw_url, headers=github_headers(), timeout=30)
+            if resp.status_code != 200:
+                return {"error": "short_entry file not found", "status": resp.status_code}
+
+            raw_dict = json.loads(resp.text).get("data", {})
+            ticker_by_code = {str(r["コード"]): r for r in ticker_list}
+
+            items = []
+            for code, sig in raw_dict.items():
+                code_str = str(code)
+
+                ticker_row = ticker_by_code.get(code_str)
+                if ticker_row is None:
+                    continue
+
+                # 除外市場フィルタ（他モードと同一ロジック）
+                market = str(ticker_row.get("市場・商品区分", ""))
+                if exclude_set and market in exclude_set:
+                    continue
+
+                # 表示対象：entry の場合はエントリー日の銘柄のみ（all は監視を含む）
+                if stage_filter == "entry" and sig.get("stage") != "entry":
+                    continue
+
+                items.append(build_item(
+                    code_str,
+                    ticker_row["銘柄名"],
+                    get_market_segment(ticker_row),
+                    calc_market_cap(code_str, sig.get("close")),
+                    sig,
+                ))
+
+            return {
+                "status": "ok",
+                "target_date": target_date,
+                "data": sort_items(items),
+            }
+
+        except Exception as e:
+            return {"error": "short_entry screening failed", "detail": str(e)}
 
     else:
         return {"error": "invalid mode"}
