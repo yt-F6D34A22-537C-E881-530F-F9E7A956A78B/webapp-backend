@@ -366,7 +366,7 @@ FAVORITES_DEFAULT = {}
 #   1ページに並べて表示）へそのまま転用するとフロントエンドの複雑性・保守コストが
 #   大きく増すため、今回のスコープからいったん除外した（将来、該当ロジックを
 #   共通関数へ切り出した上で対応する余地はある）。
-ALLOWED_FAVORITE_MODES = {"ratio", "date", "dateDown", "block", "marginBb"}
+ALLOWED_FAVORITE_MODES = {"ratio", "date", "dateDown", "block", "marginBb", "shortEntry"}
 
 
 def _get_favorites_for_write():
