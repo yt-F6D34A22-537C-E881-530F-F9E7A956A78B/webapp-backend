@@ -20,6 +20,8 @@ from app.heuristics_scoring import calc_heuristics_score
 from app.bollinger import BB_PERIOD, BB_ZONES, DEFAULT_BB_ZONE, calc_bb_area, calc_bb_position, is_in_bb_zone
 from app.symbol_search import parse_codes, normalize_name, MAX_CODES, MAX_NAME_LENGTH, MAX_RESULTS
 from app.short_entry import parse_stage_filter, build_item, sort_items
+from app.bottom_entry import (parse_bottom_stage_filter, build_bottom_item, sort_bottom_items,
+                              parse_bottom_filters, match_bottom_filters, archive_outdated)
 from app.quiz import (
     QUIZ_JUDGE_DAYS, QUIZ_MAX_ATTEMPTS, build_filters, pick_candidates, filter_answerable,
     format_date_key, judge_direction, calc_change_pct, evaluate_guess,
@@ -366,7 +368,7 @@ FAVORITES_DEFAULT = {}
 #   1ページに並べて表示）へそのまま転用するとフロントエンドの複雑性・保守コストが
 #   大きく増すため、今回のスコープからいったん除外した（将来、該当ロジックを
 #   共通関数へ切り出した上で対応する余地はある）。
-ALLOWED_FAVORITE_MODES = {"ratio", "date", "dateDown", "block", "marginBb", "shortEntry"}
+ALLOWED_FAVORITE_MODES = {"ratio", "date", "dateDown", "block", "marginBb"}
 
 
 def _get_favorites_for_write():
@@ -398,6 +400,7 @@ RAW_OHLCV_PREFIX = BASE_URL + "ohlcv/"  # ohlcv_YYYYMMDD.json 形式（2026-07�
 MARKET_CAP_JSON_URL = BASE_URL + "market_cap.json"  # {コード: 発行済株式数} 形式（2026-07 追加）
 RAW_MARGIN_PREFIX = BASE_URL + "margin/"  # margin_YYYYMMDD.json 形式（scripts/margin.js が生成する信用取引データの日次アーカイブ）
 RAW_SHORT_ENTRY_PREFIX = BASE_URL + "short_entry/"  # short_entry_YYYYMMDD.json 形式（scripts/short_entry.js が生成する空売りエントリー検出の日次アーカイブ）
+RAW_BOTTOM_ENTRY_PREFIX = BASE_URL + "bottom_entry/"  # bottom_entry_YYYYMMDD.json 形式（scripts/bottom_entry.js が生成する買い目線の下げ止まり検出の日次アーカイブ）
 
 # ============================
 # GitHub API URL（BASE_URL から抽出）
@@ -1087,6 +1090,44 @@ def get_short_entry_dates():
         return {"error": "exception", "detail": str(e)}
 
 # ============================
+# /bottom_entry_dates
+# ============================
+@app.get("/bottom_entry_dates")
+def get_bottom_entry_dates():
+    """
+    GitHub trees API を1回だけ叩き、
+    data/bottom_entry/**/bottom_entry_YYYYMMDD.json を抽出（/short_entry_dates と同一パターン）。
+    エラー時は詳細を返却する。
+    Token を付与して rate limit を回避。
+    """
+    try:
+        resp = requests.get(GIT_TREE_API, headers=github_headers())
+        if resp.status_code != 200:
+            return {
+                "error": "GitHub API error",
+                "status": resp.status_code,
+                "detail": resp.text
+            }
+
+        tree = resp.json().get("tree", [])
+        dates = []
+
+        for item in tree:
+            path = item.get("path", "")
+            # data/bottom_entry/202610/bottom_entry_20261023.json
+            m = re.match(r"data/bottom_entry/\d{6}/bottom_entry_(\d{8})\.json$", path)
+            if m:
+                dates.append(m.group(1))
+
+        return {
+            "status": "ok",
+            "dates": sorted(dates, reverse=True)
+        }
+
+    except Exception as e:
+        return {"error": "exception", "detail": str(e)}
+
+# ============================
 # /screening（ratio + date_ranking + heuristics）
 # ============================
 @app.get("/screening")
@@ -1112,7 +1153,12 @@ def screening(
     ranking_direction: str = "up",  # date_ranking モード用：up＝値上がり率（降順）／down＝値下がり率（昇順）
                                      # 省略時 up のため、本パラメータを送信しない既存の呼び出しは従来と同一の挙動
     name: str = None,               # symbol_search モード用：銘柄名（あいまい検索）。証券コードは既存の codes を共用
-    stage: str = None,              # short_entry モード用：all（監視＋エントリー）／entry（エントリーのみ）。省略時 all
+    stage: str = None,              # short_entry / bottom_entry モード用：all（監視＋エントリー）／entry（エントリーのみ）。省略時 all
+    min_drop: str = None,           # bottom_entry モード用：高値からの下落率の下限（％）。省略時 15
+    min_climax_ratio: str = None,   # bottom_entry モード用：投げ売り時の出来高倍率の下限（倍）。省略時 3
+    min_climax_drop: str = None,    # bottom_entry モード用：投げ売り直前の急落率の下限（％）。省略時 10
+    max_retest_vol: str = None,     # bottom_entry モード用：再テスト時の出来高（投げ売り日比）の上限（％）。省略時 50
+    bottom: str = None,             # bottom_entry モード用：対象の底（all＝2番底・3番底／2／3）。省略時 all
 ):
     results = []
 
@@ -1909,6 +1955,87 @@ def screening(
 
         except Exception as e:
             return {"error": "short_entry screening failed", "detail": str(e)}
+
+    # ----------------------------
+    # モード I：買い目線の下げ止まり検出（bottom_entry）
+    #   scripts/bottom_entry.js が生成した bottom_entry_YYYYMMDD.json（日次アーカイブ）を読み、
+    #   投げ売り後の2番底・3番底の確認（接近／底確認中／エントリー）を返す。
+    #   検出は生成側（Actions）で済んでおり、ここでは ohlcv の再計算を行わない
+    #   （時価総額の算出に使う終値も JSON 内の close を用いるため、ohlcv ファイルの取得も不要）。
+    # ----------------------------
+    elif mode == "bottom_entry":
+        if not target_date:
+            return {"error": "target_date is required"}
+        if not re.fullmatch(r"\d{8}", target_date):
+            return {"error": "invalid target_date", "detail": "target_date は YYYYMMDD 形式で指定してください。"}
+
+        stage_filter, stage_error = parse_bottom_stage_filter(stage)
+        if stage_error:
+            return {"error": "invalid stage", "detail": stage_error}
+
+        try:
+            exclude_set = parse_exclude_markets(exclude_markets)
+
+            raw_url = f"{RAW_BOTTOM_ENTRY_PREFIX}{target_date[:6]}/bottom_entry_{target_date}.json"
+            resp = requests.get(raw_url, headers=github_headers(), timeout=30)
+            if resp.status_code != 200:
+                return {"error": "bottom_entry file not found", "status": resp.status_code}
+
+            loaded = json.loads(resp.text)
+            archive_params = loaded.get("meta", {}).get("params", {})
+            if archive_outdated(archive_params):
+                return {"error": "bottom_entry archive is outdated",
+                        "detail": "画面条件の絞り込みに必要な指標値が無い版のアーカイブです。bottom_entry.yml を range モードで再実行してください。"}
+
+            # 画面のスクリーニング条件（アーカイブの指標値での絞り込み。下限はアーカイブの meta.params）
+            filters, filter_error = parse_bottom_filters(
+                {"min_drop": min_drop, "min_climax_ratio": min_climax_ratio, "min_climax_drop": min_climax_drop,
+                 "max_retest_vol": max_retest_vol, "bottom": bottom},
+                archive_params,
+            )
+            if filter_error:
+                return {"error": "invalid filter", "detail": filter_error}
+
+            raw_dict = loaded.get("data", {})
+            ticker_by_code = {str(r["コード"]): r for r in ticker_list}
+
+            items = []
+            for code, sig in raw_dict.items():
+                code_str = str(code)
+
+                ticker_row = ticker_by_code.get(code_str)
+                if ticker_row is None:
+                    continue
+
+                # 除外市場フィルタ（他モードと同一ロジック）
+                market = str(ticker_row.get("市場・商品区分", ""))
+                if exclude_set and market in exclude_set:
+                    continue
+
+                # 表示対象：entry の場合はエントリー日の銘柄のみ（all は監視を含む）
+                if stage_filter == "entry" and sig.get("stage") != "entry":
+                    continue
+
+                # 画面のスクリーニング条件（下落率・出来高倍率・直前の急落・再テスト時の出来高・対象の底）
+                if not match_bottom_filters(sig, filters):
+                    continue
+
+                items.append(build_bottom_item(
+                    code_str,
+                    ticker_row["銘柄名"],
+                    get_market_segment(ticker_row),
+                    calc_market_cap(code_str, sig.get("close")),
+                    sig,
+                ))
+
+            return {
+                "status": "ok",
+                "target_date": target_date,
+                "data": sort_bottom_items(items),
+            }
+
+        except Exception as e:
+            return {"error": "bottom_entry screening failed", "detail": str(e)}
 
     else:
         return {"error": "invalid mode"}
