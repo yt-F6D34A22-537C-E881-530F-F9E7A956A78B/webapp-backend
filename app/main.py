@@ -22,6 +22,9 @@ from app.symbol_search import parse_codes, normalize_name, MAX_CODES, MAX_NAME_L
 from app.short_entry import parse_stage_filter, build_item, sort_items
 from app.bottom_entry import (parse_bottom_stage_filter, build_bottom_item, sort_bottom_items,
                               parse_bottom_filters, match_bottom_filters, archive_outdated)
+from app.distribution import (parse_distribution_filters, match_distribution_filters,
+                              build_distribution_item, sort_distribution_items, limit_distribution_items,
+                              archive_outdated as distribution_archive_outdated)
 from app.quiz import (
     QUIZ_JUDGE_DAYS, QUIZ_MAX_ATTEMPTS, build_filters, pick_candidates, filter_answerable,
     format_date_key, judge_direction, calc_change_pct, evaluate_guess,
@@ -401,6 +404,7 @@ MARKET_CAP_JSON_URL = BASE_URL + "market_cap.json"  # {コード: 発行済株�
 RAW_MARGIN_PREFIX = BASE_URL + "margin/"  # margin_YYYYMMDD.json 形式（scripts/margin.js が生成する信用取引データの日次アーカイブ）
 RAW_SHORT_ENTRY_PREFIX = BASE_URL + "short_entry/"  # short_entry_YYYYMMDD.json 形式（scripts/short_entry.js が生成する空売りエントリー検出の日次アーカイブ）
 RAW_BOTTOM_ENTRY_PREFIX = BASE_URL + "bottom_entry/"  # bottom_entry_YYYYMMDD.json 形式（scripts/bottom_entry.js が生成する買い目線の下げ止まり検出の日次アーカイブ）
+RAW_DISTRIBUTION_PREFIX = BASE_URL + "distribution/"  # distribution_YYYYMMDD.json 形式（scripts/distribution.js が生成する売り抜け検出の日次アーカイブ）
 
 # ============================
 # GitHub API URL（BASE_URL から抽出）
@@ -1128,6 +1132,44 @@ def get_bottom_entry_dates():
         return {"error": "exception", "detail": str(e)}
 
 # ============================
+# /distribution_dates
+# ============================
+@app.get("/distribution_dates")
+def get_distribution_dates():
+    """
+    GitHub trees API を1回だけ叩き、
+    data/distribution/**/distribution_YYYYMMDD.json を抽出（/bottom_entry_dates と同一パターン）。
+    エラー時は詳細を返却する。
+    Token を付与して rate limit を回避。
+    """
+    try:
+        resp = requests.get(GIT_TREE_API, headers=github_headers())
+        if resp.status_code != 200:
+            return {
+                "error": "GitHub API error",
+                "status": resp.status_code,
+                "detail": resp.text
+            }
+
+        tree = resp.json().get("tree", [])
+        dates = []
+
+        for item in tree:
+            path = item.get("path", "")
+            # data/distribution/202610/distribution_20261023.json
+            m = re.match(r"data/distribution/\d{6}/distribution_(\d{8})\.json$", path)
+            if m:
+                dates.append(m.group(1))
+
+        return {
+            "status": "ok",
+            "dates": sorted(dates, reverse=True)
+        }
+
+    except Exception as e:
+        return {"error": "exception", "detail": str(e)}
+
+# ============================
 # /screening（ratio + date_ranking + heuristics）
 # ============================
 @app.get("/screening")
@@ -1159,6 +1201,11 @@ def screening(
     min_climax_drop: str = None,    # bottom_entry モード用：投げ売り直前の急落率の下限（％）。省略時 10
     max_retest_vol: str = None,     # bottom_entry モード用：再テスト時の出来高（投げ売り日比）の上限（％）。省略時 50
     bottom: str = None,             # bottom_entry モード用：対象の底（all＝2番底・3番底／2／3）。省略時 all
+    min_vol_ratio: str = None,      # distribution モード用：判定日の出来高倍率（直前50日平均比）の下限（倍）。省略時 2
+    min_body_drop: str = None,      # distribution モード用：実体下落率（始値→終値）の下限（％）。省略時 3
+    max_high_gap: str = None,       # distribution モード用：前日終値の直近高値からの乖離の許容幅（％）。省略時 10
+    min_rise: str = None,           # distribution モード用：直前上昇率の下限（％）。省略時 20
+    min_market_cap: str = None,     # distribution モード用：時価総額（円）の下限。省略時 0（指定なし）
 ):
     results = []
 
@@ -2036,6 +2083,86 @@ def screening(
 
         except Exception as e:
             return {"error": "bottom_entry screening failed", "detail": str(e)}
+
+    # ----------------------------
+    # モード J：売り抜け検出（distribution）
+    #   scripts/distribution.js が生成した distribution_YYYYMMDD.json（日次アーカイブ）を読み、
+    #   高値圏で出来高を伴う大陰線が出現した銘柄（大口の売り抜けの可能性）を返す。
+    #   検出は生成側（Actions）で済んでおり、ここでは ohlcv の再計算を行わない
+    #   （時価総額の算出に使う終値も JSON 内の close を用いるため、ohlcv ファイルの取得も不要）。
+    # ----------------------------
+    elif mode == "distribution":
+        if not target_date:
+            return {"error": "target_date is required"}
+        if not re.fullmatch(r"\d{8}", target_date):
+            return {"error": "invalid target_date", "detail": "target_date は YYYYMMDD 形式で指定してください。"}
+
+        try:
+            exclude_set = parse_exclude_markets(exclude_markets)
+
+            raw_url = f"{RAW_DISTRIBUTION_PREFIX}{target_date[:6]}/distribution_{target_date}.json"
+            resp = requests.get(raw_url, headers=github_headers(), timeout=30)
+            if resp.status_code != 200:
+                return {"error": "distribution file not found", "status": resp.status_code}
+
+            loaded = json.loads(resp.text)
+            archive_params = loaded.get("meta", {}).get("params", {})
+            if distribution_archive_outdated(archive_params):
+                return {"error": "distribution archive is outdated",
+                        "detail": "画面条件の絞り込みに必要な指標値が無い版のアーカイブです。distribution.yml を range モードで再実行してください。"}
+
+            # 画面のスクリーニング条件（アーカイブの指標値での絞り込み。範囲の片側はアーカイブの meta.params）
+            filters, filter_error = parse_distribution_filters(
+                {"min_vol_ratio": min_vol_ratio, "min_body_drop": min_body_drop,
+                 "max_high_gap": max_high_gap, "min_rise": min_rise, "min_market_cap": min_market_cap},
+                archive_params,
+            )
+            if filter_error:
+                return {"error": "invalid filter", "detail": filter_error}
+
+            raw_dict = loaded.get("data", {})
+            ticker_by_code = {str(r["コード"]): r for r in ticker_list}
+
+            items = []
+            for code, sig in raw_dict.items():
+                code_str = str(code)
+
+                ticker_row = ticker_by_code.get(code_str)
+                if ticker_row is None:
+                    continue
+
+                # 除外市場フィルタ（他モードと同一ロジック）
+                market = str(ticker_row.get("市場・商品区分", ""))
+                if exclude_set and market in exclude_set:
+                    continue
+
+                if not match_distribution_filters(sig, filters):
+                    continue
+
+                # 時価総額の下限（アーカイブには含めず、他モードと同じ calc_market_cap で都度算出する。
+                # 算出できない銘柄は、下限指定時は対象外）
+                market_cap = calc_market_cap(code_str, sig.get("close"))
+                if filters["min_market_cap"] > 0 and (market_cap is None or market_cap < filters["min_market_cap"]):
+                    continue
+
+                items.append(build_distribution_item(
+                    code_str,
+                    ticker_row["銘柄名"],
+                    get_market_segment(ticker_row),
+                    market_cap,
+                    sig,
+                ))
+
+            items, truncated = limit_distribution_items(sort_distribution_items(items))
+            return {
+                "status": "ok",
+                "target_date": target_date,
+                "truncated": truncated,  # 件数上限（DISTRIBUTION_MAX_RESULTS）で打ち切った場合 true
+                "data": items,
+            }
+
+        except Exception as e:
+            return {"error": "distribution screening failed", "detail": str(e)}
 
     else:
         return {"error": "invalid mode"}
